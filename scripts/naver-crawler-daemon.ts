@@ -178,6 +178,30 @@ async function runCrawl(page: Page, limit = 200, stopAfterDupes = 0): Promise<Cr
     }
   }
 
+  // 2-b) 비상품 영구 스킵 캐시 — 출석/후기 등 가격 없는 글의 매 사이클 본문 재진입 방지
+  const ignoredIds = new Set<number>();
+  {
+    let from = 0;
+    const PAGE = 1000;
+    while (true) {
+      const { data, error } = await sb
+        .from('crawl_ignored_articles')
+        .select('cafe_article_id')
+        .range(from, from + PAGE - 1);
+      if (error) {
+        warnings.push(`비상품 스킵 캐시 조회 실패(스킵 없이 진행): ${error.message}`);
+        break;
+      }
+      (data || []).forEach((r: any) => {
+        if (r.cafe_article_id !== null && r.cafe_article_id !== undefined) {
+          ignoredIds.add(Number(r.cafe_article_id));
+        }
+      });
+      if (!data || data.length < PAGE) break;
+      from += PAGE;
+    }
+  }
+
   // 3) 활성 매니저 닉네임 → id 맵
   const managerMap = new Map<string, string>();
   {
@@ -194,12 +218,13 @@ async function runCrawl(page: Page, limit = 200, stopAfterDupes = 0): Promise<Cr
     }
   }
 
-  // 4) 미존재 ID만, 올라온 순서(오름차순)로 처리
+  // 4) 미존재 + 비상품 캐시 제외, 올라온 순서(오름차순)로 처리
   const targets = candidates
-    .filter((c) => !existingIds.has(c.articleId))
+    .filter((c) => !existingIds.has(c.articleId) && !ignoredIds.has(c.articleId))
     .sort((a, b) => a.articleId - b.articleId);
 
-  console.log(`[CrawlDaemon] 목록 ${scanned}건 중 신규 후보 ${targets.length}건 본문 수집 시작...`);
+  const ignoredHit = candidates.filter((c) => !existingIds.has(c.articleId) && ignoredIds.has(c.articleId)).length;
+  console.log(`[CrawlDaemon] 목록 ${scanned}건 중 신규 후보 ${targets.length}건 본문 수집 시작... (비상품 캐시 스킵 ${ignoredHit}건)`);
 
   let codeCursor = await computeNextProductCode();
 
@@ -256,6 +281,22 @@ async function runCrawl(page: Page, limit = 200, stopAfterDupes = 0): Promise<Cr
         if (!resolvedFromLink) {
           failed++;
           warnings.push(`#${t.articleId} 가격 파싱 실패: "${detail.title.slice(0, 40)}"`);
+          // 가격도 없고 끌어올림 링크도 없으면 = 출석/후기 등 비상품 글 → 영구 스킵 캐시에 등록(다음 사이클 재방문 차단).
+          // 링크는 있으나 원본 회수만 실패한 경우는 일시적일 수 있어 캐시하지 않는다.
+          if (!linkedUrl) {
+            const { error: ignErr } = await sb
+              .from('crawl_ignored_articles')
+              .upsert(
+                { cafe_article_id: t.articleId, reason: 'no_price', title: detail.title.slice(0, 200) },
+                { onConflict: 'cafe_article_id' }
+              );
+            if (ignErr) {
+              warnings.push(`#${t.articleId} 비상품 캐시 등록 실패: ${ignErr.message}`);
+            } else {
+              ignoredIds.add(t.articleId);
+              console.log(`[CrawlDaemon] 🚫 #${t.articleId} 비상품(가격·링크 없음) → 스킵 캐시 등록: "${detail.title.slice(0, 30)}"`);
+            }
+          }
           continue;
         }
       }

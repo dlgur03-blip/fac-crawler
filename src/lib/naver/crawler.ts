@@ -321,6 +321,7 @@ export interface CafeArticleDetail {
   sourcePrice: number | null;
   fee: number;
   sizes: string;
+  colors: string;
 }
 
 const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -382,6 +383,134 @@ function parseSizesFromTitle(title: string): string {
     return alpha[0].replace(/\s+/g, '').toUpperCase();
   }
   return '';
+}
+
+/* ----------------------------------------------------------------------------
+ * 옵션(사이즈/컬러) 파싱 — 2026-07-10
+ * 원칙: 미추출 > 과추출 (틀린 옵션이 노출되느니 빈 값으로 두고 어드민 수동 보정)
+ * -------------------------------------------------------------------------- */
+
+const ALPHA_SIZE_ORDER = ['XS', 'S', 'M', 'L', 'XL', 'XXL', '2XL', '3XL', '4XL'];
+
+// 실측 카페 상품글에서 쓰이는 컬러 표기 사전 (라벨 없는 열거 라인 판정용)
+const COLOR_DICT = new Set([
+  '블랙', '화이트', '아이보리', '베이지', '크림', '그레이', '차콜', '네이비', '곤색',
+  '카키', '브라운', '와인', '버건디', '핑크', '소라', '연청', '중청', '진청', '흑청',
+  '오트밀', '머스타드', '민트', '라벤더', '레드', '블루', '그린', '옐로우', '퍼플',
+  '오렌지', '스카이', '모카', '카멜', '캐멀', '먹색', '백색', '흑색', '회색', '검정',
+  '흰색', '노랑', '파랑', '빨강', '초록', '보라',
+]);
+
+/** "S~XL" 알파 범위를 고정 순서표로 전개. 순서표 밖이거나 역순이면 null */
+function expandAlphaSizeRange(a: string, b: string): string[] | null {
+  const i = ALPHA_SIZE_ORDER.indexOf(a.toUpperCase());
+  const j = ALPHA_SIZE_ORDER.indexOf(b.toUpperCase());
+  if (i === -1 || j === -1 || i >= j) return null;
+  return ALPHA_SIZE_ORDER.slice(i, j + 1);
+}
+
+/** 옵션 토큰 공통 필터: 1~10자, 숫자 시작 아님(사이즈 제외), 잡단어 배제 */
+function cleanOptionTokens(raw: string, allowNumeric: boolean): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const t of raw.split(/[,/·|]+|\s{2,}|\s(?=\S)/).map((s) => s.trim()).filter(Boolean)) {
+    if (t.length < 1 || t.length > 10) continue;
+    if (!allowNumeric && /\d/.test(t)) continue;
+    if (/원|사이즈|컬러|색상|옵션|배송|주문|가격/.test(t)) continue;
+    const key = t.toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(t);
+    if (out.length >= 15) break; // 잡텍스트 폭주 가드
+  }
+  return out;
+}
+
+/**
+ * 제목+본문에서 사이즈/컬러 옵션 추출.
+ * 사이즈 우선순위: 라벨 라인 → 제목 점구분 숫자 → 본문 점구분 숫자(3개 이상, 가격 라인 제외)
+ *                → 알파 콤마 패턴(제목→본문) → 프리사이즈
+ * 컬러: 라벨 라인 → 라벨 없는 열거 라인(사전 70% 히트)
+ */
+export function parseOptions(title: string, content: string): { sizes: string; colors: string } {
+  const lines = (content || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  let sizes = '';
+  let colors = '';
+
+  for (const line of lines) {
+    // 사이즈 라벨 라인: "사이즈 : S,M,L" / "size: 90~110"
+    if (!sizes) {
+      const m = line.match(/^(?:사이즈|size)\s*[:：]\s*(.+)$/i);
+      if (m) {
+        const range = m[1].match(/^([A-Za-z0-9]{1,3})\s*[~-]\s*([A-Za-z0-9]{1,3})$/);
+        if (range && /[A-Za-z]/.test(range[1])) {
+          const expanded = expandAlphaSizeRange(range[1], range[2]);
+          if (expanded) sizes = expanded.join(',');
+        }
+        if (!sizes) {
+          const tokens = cleanOptionTokens(m[1], true);
+          if (tokens.length) sizes = tokens.map((t) => t.toUpperCase()).join(',');
+        }
+      }
+    }
+    // 컬러 라벨 라인: "컬러 : 블랙/아이보리" / "색상: 크림, 소라"
+    if (!colors) {
+      const m = line.match(/^(?:컬러|칼라|색상|color)\s*[:：]\s*(.+)$/i);
+      if (m) {
+        const tokens = cleanOptionTokens(m[1], false);
+        if (tokens.length) colors = tokens.join(',');
+      }
+    }
+    if (sizes && colors) break;
+  }
+
+  // 제목 점구분 숫자 "110.120.130" (기존 로직)
+  if (!sizes) sizes = parseSizesFromTitle(title);
+
+  // 본문 점구분 숫자 라인 — 숫자 3개 이상 요구("14.700" 천단위 가격 오인 차단) + 가격 라인 제외
+  if (!sizes) {
+    for (const line of lines) {
+      const norm = line.replace(/원/g, ' ').trim();
+      if (norm.match(PRICE_PAIR_RE) || norm.match(PRICE_PAIR_END_RE)) continue;
+      const m = line.match(/^(\d{2,3})((?:\.\d{2,3}){2,})$/);
+      if (m) {
+        sizes = (m[1] + m[2]).split('.').join(',');
+        break;
+      }
+    }
+  }
+
+  // 알파 콤마 패턴 (본문)
+  if (!sizes) {
+    for (const line of lines) {
+      const m = line.match(/\b(?:XS|S|M|L|XL|XXL|2XL|3XL)(?:\s*,\s*(?:XS|S|M|L|XL|XXL|2XL|3XL))+\b/i);
+      if (m) {
+        sizes = m[0].replace(/\s+/g, '').toUpperCase();
+        break;
+      }
+    }
+  }
+
+  // 프리사이즈: "프리사이즈"/"FREE size" 명시 또는 단독 "FREE" 라인만 인정
+  if (!sizes && (/(?:프리|free)\s*(?:사이즈|size)/i.test(content) || lines.some((l) => /^free$/i.test(l)))) {
+    sizes = 'FREE';
+  }
+
+  // 라벨 없는 컬러 열거 라인: 토큰 2개 이상 + 사전 히트율 70% 이상
+  if (!colors) {
+    for (const line of lines) {
+      if (/\d/.test(line) || line.length > 60) continue;
+      const tokens = cleanOptionTokens(line, false);
+      if (tokens.length < 2) continue;
+      const hits = tokens.filter((t) => COLOR_DICT.has(t)).length;
+      if (hits / tokens.length >= 0.7) {
+        colors = tokens.join(',');
+        break;
+      }
+    }
+  }
+
+  return { sizes, colors };
 }
 
 /**
@@ -460,8 +589,23 @@ export function detectSoldoutFromTitle(title: string): boolean {
  * 끌어올리는 패턴이 지배적 — 링크 글 자체엔 가격이 없으므로 원본을 따라가야 한다.
  */
 export function extractLinkedCafeUrl(content: string): string | null {
-  const m = content.match(/https?:\/\/naver\.me\/[A-Za-z0-9]+|https?:\/\/(?:m\.)?cafe\.naver\.com\/\S+/);
-  return m ? m[0] : null;
+  const urls = extractLinkedCafeUrls(content);
+  return urls.length ? urls[0] : null;
+}
+
+/**
+ * 본문 내 카페 글 링크 전부 추출(최대 2개) — 꼬리 잡음(닫는 괄호·마침표·한글 붙음) 제거.
+ * 실측: 본문에 링크가 여러 개거나 링크 뒤에 텍스트가 붙는 글이 있어 첫 링크 하나만으론 원본 회수 실패.
+ */
+export function extractLinkedCafeUrls(content: string): string[] {
+  const matches = content.match(/https?:\/\/naver\.me\/[A-Za-z0-9]+|https?:\/\/(?:m\.)?cafe\.naver\.com\/\S+/g) || [];
+  const out: string[] = [];
+  for (const raw of matches) {
+    const url = raw.replace(/[)\]>,."'”’]+$/g, '').replace(/[가-힣ㄱ-ㅎㅏ-ㅣ].*$/, '');
+    if (url.startsWith('http') && !out.includes(url)) out.push(url);
+    if (out.length >= 2) break;
+  }
+  return out;
 }
 
 /**
@@ -793,7 +937,7 @@ export async function scrapeCafeDetail(
 
     const { sourcePrice, fee } = parsePriceAndFee(data.content);
     const postedAt = parsePostedAtText(data.postedAtRaw);
-    const sizes = parseSizesFromTitle(data.title);
+    const { sizes, colors } = parseOptions(data.title, data.content);
 
     return {
       articleId,
@@ -805,6 +949,7 @@ export async function scrapeCafeDetail(
       sourcePrice,
       fee,
       sizes,
+      colors,
     };
   } catch (error) {
     console.error(`[Crawler] Article ${articleId} 상세 정보 수집 실패:`, error);

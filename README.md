@@ -1,6 +1,13 @@
-# FACTORIES 크롤러 데몬 (fac-crawler)
+# FACTORIES 크롤러 + 포스팅 데몬 (fac-crawler)
 
-네이버 카페(팩토리 구매대행, clubId 28310071)의 상품 글을 10분 주기로 크롤링해 jinshopping.com 쇼핑몰(Supabase)에 자동 등록하는 상주 데몬입니다. **항시 켜둔 윈도우 미니PC에서 돌리는 용도**의 독립 레포이며, 쇼핑몰 본체 코드는 `fac` 레포에 있습니다.
+네이버 카페(팩토리 구매대행, clubId 28310071)의 상품 글을 10분 주기로 크롤링해 jinshopping.com 쇼핑몰(Supabase)에 자동 등록하는 **크롤러 데몬**과, 관리자 페이지의 재업(끌올)/신규 등록 요청을 받아 카페에 글을 쓰는 **포스팅 데몬** 2개로 구성됩니다. **항시 켜둔 윈도우 미니PC에서 돌리는 용도**의 독립 레포이며, 쇼핑몰 본체 코드는 `fac` 레포에 있습니다.
+
+| 데몬 | 실행 | 큐 | 역할 | 프로필 |
+|---|---|---|---|---|
+| 크롤러 | `npm run crawler-daemon` | `crawl_queue` | 카페 → 몰 (수집) | `.naver_profile` |
+| 포스팅 | `npm run naver-daemon` | `posting_queue` | 몰 → 카페 (재업/신규 글쓰기) | `.naver_profile_poster` |
+
+프로필 디렉토리가 분리돼 있어 **두 데몬 동시 가동 가능**합니다.
 
 > 🤖 **Claude Code로 설치하는 경우**: 이 폴더에서 Claude Code를 열고 "README대로 설치하고 작업 스케줄러까지 등록해줘"라고 하면 됩니다. 사람이 직접 할 일은 `.env.local` 넣기와 첫 로그인 캡차 풀기 정도입니다.
 
@@ -58,6 +65,50 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 
 ### 8. 기존 머신 데몬 끄기 (이중 크롤 방지)
 맥에서: `pkill -f naver-crawler-daemon`
+
+---
+
+## 포스팅(재업/끌올) 데몬 설치
+
+관리자 상품 대시보드에서 상품을 선택해 "재업 ♻️"을 누르면 `posting_queue`에 쌓이고, 이 데몬이 카페에 본문 통째로 새 글을 등록합니다.
+
+### 1. 환경변수 추가 (`.env.local`)
+```
+# 포스팅 계정 (핫딜매니저 등 — 미설정 시 크롤러와 같은 NAVER_USER_ID 사용)
+NAVER_POSTER_USER_ID=핫딜매니저_아이디
+NAVER_POSTER_PW=핫딜매니저_비밀번호
+
+# 포스팅 대상 카페 — 미설정 시 테스트 카페(31729221, 이혁의카페)
+# 테스트 검증 후 실카페로 전환:
+# NAVER_POST_CAFE_ID=28310071
+```
+
+### 2. 첫 실행 — 포스팅 계정 로그인 (창 띄워서)
+```cmd
+cd %USERPROFILE%\fac-crawler
+set NAVER_HEADLESS=false
+npm run naver-daemon
+```
+캡차/기기확인을 눈으로 풀면 세션이 `.naver_profile_poster`에 저장됩니다. `🟢 데몬 시작` 확인 후 `Ctrl+C`.
+
+### 3. 자동 시작 등록 (관리자 PowerShell)
+```powershell
+cd $env:USERPROFILE\fac-crawler\scripts\windows
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\install-poster-task.ps1
+```
+
+### 4. 검증 순서
+1. `NAVER_POST_CAFE_ID` **미설정**(=테스트 카페) 상태로 관리자에서 1~2건 재업 → 테스트 카페에 글 생김 + 큐 DONE 확인
+2. `.env.local`에 `NAVER_POST_CAFE_ID=28310071` 추가 → 데몬 재시작 → 실카페 1건 재업 검증
+3. 실카페 재업 성공 시 상품의 `cafe_article_id`가 새 글로 갱신돼 다음 크롤이 중복 수집하지 않음
+
+### 관리 명령
+| 작업 | 명령 |
+|---|---|
+| 시작/중지 | `Start-ScheduledTask`/`Stop-ScheduledTask -TaskName "FACTORIES-PosterDaemon"` |
+| 제거 | `Unregister-ScheduledTask -TaskName "FACTORIES-PosterDaemon" -Confirm:$false` |
+| 로그 | `notepad %USERPROFILE%\fac-crawler\poster-daemon.log` |
 
 ---
 

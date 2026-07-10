@@ -55,7 +55,6 @@ const mockStorage: { [key: string]: any[] } = {
       recipient_name: '데모 회원',
       recipient_phone: '010-1234-5678',
       shipping_address: '서울특별시 강남구 테헤란로 123, 4층',
-      custom_code: 'P123456789012',
       total_amount: 49000,
       payment_status: 'PAID',
       shipping_status: 'PREPARING',

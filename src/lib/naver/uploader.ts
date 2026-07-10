@@ -163,7 +163,9 @@ export async function loginToNaver(page: Page): Promise<boolean> {
  * 🛠️ 네이버 카페 글쓰기 자동 포스팅 엔진
  */
 export async function uploadToNaverCafe(payload: UploadPayload): Promise<string | null> {
-  const targetCafeId = '31729221'; // 사용자의 테스트 카페 ID (clubId)
+  // 포스팅 대상 카페 (env 전환): 기본값은 테스트 카페(31729221, 이혁의카페).
+  // 실카페 전환 시 윈도우 .env.local에 NAVER_POST_CAFE_ID=28310071 한 줄 추가.
+  const targetCafeId = process.env.NAVER_POST_CAFE_ID || '31729221';
   
   // 🚨 [위임 모드 기동 가드] 만약 NAVER_POSTER_PROXY_URL 설정이 활성화되어 있다면 로컬 데몬 서버로 위임!
   const proxyUrl = process.env.NAVER_POSTER_PROXY_URL;
@@ -203,7 +205,10 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
   const localImagePaths = await downloadImagesToLocal(payload.imageUrls, payload.productCode);
   
   const browser = await puppeteer.launch({
-    headless: true,
+    // NAVER_HEADLESS=false 면 창 표시 — 새 기기 첫 로그인 캡차/기기확인을 눈으로 처리할 때 사용
+    headless: process.env.NAVER_HEADLESS === 'false' ? false : true,
+    // CDP 응답 무한 대기를 에러로 전환 (크롤러 데몬과 동일한 hang 방어)
+    protocolTimeout: 120_000,
     // NAVER_PROFILE_DIR 지정 시 크롬 프로필을 영속화 → 네이버 로그인 세션 유지(매번 재로그인 방지)
     userDataDir: process.env.NAVER_PROFILE_DIR || undefined,
     args: [

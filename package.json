@@ -5,7 +5,8 @@
   "description": "FACTORIES 네이버 카페 크롤러 데몬 (미니PC 상주용)",
   "scripts": {
     "crawler-daemon": "tsx scripts/naver-crawler-daemon.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "naver-daemon": "tsx scripts/naver-poster-daemon.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.106.0",

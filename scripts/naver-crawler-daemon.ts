@@ -12,7 +12,8 @@
  *
  * 필요 env (.env.local에서 자동 로드):
  *   NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, NAVER_USER_ID, NAVER_USER_PW
- *   NAVER_PROFILE_DIR (미설정 시 ./.naver_profile — 포스팅 데몬과 로그인 세션 공유)
+ *   NAVER_PROFILE_DIR (미설정 시 ./.naver_profile — 포스팅 데몬과 동시 가동 시 프로필 분리 필수:
+ *                      포스팅 데몬은 기본 ./.naver_profile_poster 사용, Chromium userDataDir 락 충돌 방지)
  *   NAVER_CAFE_CLUB_ID (미설정 시 28310071)
  */
 import fs from 'fs';
@@ -52,7 +53,97 @@ const sb = createClient(SUPA_URL, SVC, { auth: { persistSession: false } });
 
 const POLL_MS = 15_000;          // 큐 폴링 주기
 const SCHEDULE_MS = 10 * 60_000; // 자체 스케줄 크롤 주기 (10분)
+const HEARTBEAT_MS = 60_000;     // 크롤 중 crawl_queue.updated_at 갱신 주기 (스로틀)
+const STALL_MS = 10 * 60_000;    // watchdog: 작업 중 무진행 10분이면 좀비로 판정 (아이템 1건 최악 ~2분의 5배)
+const STALE_JOB_MS = 15 * 60_000;// 큐의 PROCESSING 행이 15분 무갱신이면 죽은 데몬의 잔재로 판정
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 하부 puppeteer 작업이 protocolTimeout까지 뚫고 wedge되는 케이스 방어.
+ * 타임아웃 시 아이템 레벨에서 삼키지 않고 job 레벨로 throw해야 한다 —
+ * 취소 불가능한 promise를 남긴 채 같은 page를 계속 쓰면 위험하므로,
+ * outer catch가 resetBrowser() 후 큐 재시도(existingIds 스킵으로 자연 재개)하는 경로를 탄다.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`[Timeout] ${label} ${ms / 1000}s 초과`)), ms);
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
+// ---- watchdog/heartbeat 상태 ----
+let currentJobId: string | null = null;   // 처리 중인 crawl_queue job id (idle이면 null)
+let lastProgressAt = Date.now();          // 마지막 진행 시각 — 아이템 루프/폴링에서 갱신
+let lastHeartbeatAt = 0;                  // DB heartbeat 스로틀
+
+function markProgress() {
+  lastProgressAt = Date.now();
+}
+
+/** 크롤 진행 중 60초 스로틀로 crawl_queue.updated_at + 진행 카운트 갱신 (어드민 배너가 이걸 봄) */
+async function heartbeat(jobId: string, progress: { done: number; total: number }) {
+  markProgress();
+  if (Date.now() - lastHeartbeatAt < HEARTBEAT_MS) return;
+  lastHeartbeatAt = Date.now();
+  try {
+    await sb
+      .from('crawl_queue')
+      .update({ updated_at: new Date().toISOString(), result: { progress } })
+      .eq('id', jobId)
+      .eq('status', 'PROCESSING');
+  } catch { /* heartbeat 실패는 크롤을 막지 않음 */ }
+}
+
+/**
+ * 좀비 PROCESSING 회수 — hang 중 프로세스가 죽으면 PROCESSING 행이 영구 잔류하고,
+ * hasActiveJob()이 이를 활성으로 봐서 재시작 후에도 SCHEDULED 크롤이 영원히 생성되지 않던 버그의 수정.
+ * heartbeat(≤60초 간격) 덕분에 15분 무갱신 PROCESSING = 확실한 좀비.
+ */
+async function recoverStaleJobs() {
+  try {
+    const cutoff = new Date(Date.now() - STALE_JOB_MS).toISOString();
+    const { data: stale } = await sb
+      .from('crawl_queue')
+      .select('id, attempts, max_attempts')
+      .eq('status', 'PROCESSING')
+      .lt('updated_at', cutoff);
+    for (const j of stale || []) {
+      const isFinal = j.attempts >= (j.max_attempts || 3);
+      await sb
+        .from('crawl_queue')
+        .update({
+          status: isFinal ? 'FAILED' : 'PENDING',
+          error: `좀비 PROCESSING 회수 (${STALE_JOB_MS / 60_000}분 무갱신 — 데몬 사망/hang 추정)`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', j.id)
+        .eq('status', 'PROCESSING');
+      console.warn(`[CrawlDaemon] ♻️ 좀비 작업 회수: job ${j.id} → ${isFinal ? 'FAILED' : 'PENDING'}`);
+    }
+  } catch (e: any) {
+    console.warn('[CrawlDaemon] 좀비 작업 회수 실패(무시):', e?.message);
+  }
+}
+
+/** 내부 watchdog: 작업 중 STALL_MS 무진행이면 큐를 되돌리고 자폭 → 윈도우 래퍼(crawler-daemon-loop.cmd)가 10초 후 재기동 */
+function startWatchdog() {
+  setInterval(async () => {
+    if (currentJobId === null) return;
+    if (Date.now() - lastProgressAt <= STALL_MS) return;
+    console.error(`[CrawlDaemon] 🐶 watchdog: ${STALL_MS / 60_000}분 무진행 (job ${currentJobId}) — 프로세스 재시작`);
+    try {
+      await sb
+        .from('crawl_queue')
+        .update({ status: 'PENDING', error: 'watchdog 재시작 (무진행 감지)', updated_at: new Date().toISOString() })
+        .eq('id', currentJobId)
+        .eq('status', 'PROCESSING');
+    } catch { /* best effort */ }
+    process.exit(1);
+  }, 30_000);
+}
 
 export interface CrawlResult {
   scanned: number;
@@ -78,6 +169,8 @@ async function getPage(): Promise<Page> {
     // NAVER_HEADLESS=false 면 창 표시 — 새 기기 첫 로그인에서 캡차/기기확인을 눈으로 처리할 때 사용
     headless: process.env.NAVER_HEADLESS === 'false' ? false : true,
     userDataDir: process.env.NAVER_PROFILE_DIR,
+    // CDP 응답 무한 대기(hang의 전형)를 에러로 전환 — withTimeout/watchdog과 함께 3중 방어
+    protocolTimeout: 120_000,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -86,6 +179,9 @@ async function getPage(): Promise<Page> {
     ],
   });
   pageRef = await browser.newPage();
+  // timeout 미지정 waitFor/goto(uploader.ts 로그인 경로 포함)까지 전부 커버하는 기본 타임아웃
+  pageRef.setDefaultTimeout(30_000);
+  pageRef.setDefaultNavigationTimeout(35_000);
   await pageRef.setViewport({ width: 1280, height: 1024 });
   await pageRef.setUserAgent(
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -137,8 +233,8 @@ async function computeNextProductCode(): Promise<number> {
 
 // ---- 크롤 본체 ----
 // stopAfterDupes > 0 이면 연속 중복(dedup 스킵) 그 횟수 도달 시 조기 종료 — "중복 전까지" 대량 수집용
-async function runCrawl(page: Page, limit = 200, stopAfterDupes = 0): Promise<CrawlResult> {
-  const { scrapeCafeList, scrapeCafeDetail, extractLinkedCafeUrl, resolveCafeArticleIdFromUrl, detectSoldoutFromTitle } =
+async function runCrawl(page: Page, jobId: string, limit = 200, stopAfterDupes = 0): Promise<CrawlResult> {
+  const { scrapeCafeList, scrapeCafeDetail, extractLinkedCafeUrls, resolveCafeArticleIdFromUrl, detectSoldoutFromTitle } =
     await import('../src/lib/naver/crawler');
   const { buildDedupKey } = await import('../src/lib/naver/dedup');
 
@@ -149,7 +245,8 @@ async function runCrawl(page: Page, limit = 200, stopAfterDupes = 0): Promise<Cr
   let failed = 0;
 
   // 1) 목록 수집 → 공지 제외 → 최신 limit건
-  const list: CafeListItem[] = await scrapeCafeList(page, CLUB_ID, limit);
+  const list: CafeListItem[] = await withTimeout(scrapeCafeList(page, CLUB_ID, limit), 10 * 60_000, 'scrapeCafeList');
+  markProgress();
   const candidates = list
     .filter((i) => !i.isNotice)
     .sort((a, b) => b.articleId - a.articleId)
@@ -218,13 +315,29 @@ async function runCrawl(page: Page, limit = 200, stopAfterDupes = 0): Promise<Cr
     }
   }
 
-  // 4) 미존재 + 비상품 캐시 제외, 올라온 순서(오름차순)로 처리
+  // 3-b) 작성자 블록리스트 — 해당 닉네임 글은 크롤 자체 스킵 (2026-07-10 굿걸스텝 제외 등)
+  const blockedAuthors = new Set<string>();
+  {
+    const { data: blocked, error: blkErr } = await sb.from('crawl_blocked_authors').select('nickname');
+    if (blkErr) {
+      warnings.push(`블록리스트 조회 실패(차단 없이 진행): ${blkErr.message}`);
+    } else {
+      (blocked || []).forEach((b: any) => {
+        if (b.nickname) blockedAuthors.add(String(b.nickname).trim());
+      });
+    }
+  }
+
+  // 4) 미존재 + 비상품 캐시 + 블록 작성자 제외, 올라온 순서(오름차순)로 처리
+  // (목록의 author는 폴백 체인이라 빈 값일 수 있음 — 상세 파싱 후 이중 가드 있음)
   const targets = candidates
     .filter((c) => !existingIds.has(c.articleId) && !ignoredIds.has(c.articleId))
+    .filter((c) => !blockedAuthors.has((c.author || '').trim()))
     .sort((a, b) => a.articleId - b.articleId);
 
   const ignoredHit = candidates.filter((c) => !existingIds.has(c.articleId) && ignoredIds.has(c.articleId)).length;
-  console.log(`[CrawlDaemon] 목록 ${scanned}건 중 신규 후보 ${targets.length}건 본문 수집 시작... (비상품 캐시 스킵 ${ignoredHit}건)`);
+  const blockedHit = candidates.filter((c) => blockedAuthors.has((c.author || '').trim())).length;
+  console.log(`[CrawlDaemon] 목록 ${scanned}건 중 신규 후보 ${targets.length}건 본문 수집 시작... (비상품 캐시 스킵 ${ignoredHit}건, 블록 작성자 스킵 ${blockedHit}건)`);
 
   let codeCursor = await computeNextProductCode();
 
@@ -234,68 +347,159 @@ async function runCrawl(page: Page, limit = 200, stopAfterDupes = 0): Promise<Cr
     ? [...targets].sort((a, b) => b.articleId - a.articleId)
     : targets;
   let dupeStreak = 0;
+  let done = 0;
+
+  // 영구 스킵 캐시 등록 헬퍼 (비상품/블록작성자/처리완료 끌올 글)
+  const markIgnored = async (articleId: number, reason: string, title: string) => {
+    const { error: ignErr } = await sb
+      .from('crawl_ignored_articles')
+      .upsert(
+        { cafe_article_id: articleId, reason, title: title.slice(0, 200) },
+        { onConflict: 'cafe_article_id' }
+      );
+    if (ignErr) {
+      warnings.push(`#${articleId} 스킵 캐시(${reason}) 등록 실패: ${ignErr.message}`);
+    } else {
+      ignoredIds.add(articleId);
+    }
+  };
 
   for (const t of orderedTargets) {
+    done++;
+    await heartbeat(jobId, { done, total: orderedTargets.length });
     await sleep(2000 + Math.floor(Math.random() * 2000)); // 건당 2~4초 랜덤 지연
 
     try {
-      const detail = await scrapeCafeDetail(page, CLUB_ID, t.articleId);
+      const detail = await withTimeout(scrapeCafeDetail(page, CLUB_ID, t.articleId), 90_000, `scrapeCafeDetail #${t.articleId}`);
       if (!detail) {
         failed++;
         warnings.push(`#${t.articleId} 상세 파싱 실패 (제목/본문 추출 불가)`);
         continue;
       }
+
+      // 작성자 블록리스트 이중 가드 — 목록 author가 빈 값이어도 상세에서 확실히 차단 + 캐시로 재진입 방지
+      if (detail.authorNickname && blockedAuthors.has(detail.authorNickname.trim())) {
+        await markIgnored(t.articleId, 'blocked_author', detail.title);
+        console.log(`[CrawlDaemon] ⛔ #${t.articleId} 블록 작성자(${detail.authorNickname.trim()}) — 스킵 캐시 등록`);
+        continue;
+      }
+
       if (detail.sourcePrice === null) {
-        // 링크 끌어올림 글: 본문이 원본 글 링크 한 줄뿐인 지배적 패턴 — 원본을 따라가 가격/본문/이미지 회수
+        // 링크 끌어올림 글: 본문이 원본 글 링크 한 줄뿐인 지배적 패턴 — 원본을 따라가 가격/본문/이미지 회수.
+        // 2026-07-10 변경: 원본이 이미 적재돼 있어도 반드시 들어가 최신 정보(가격/품절/옵션)를 갱신하고
+        // posted_at을 끌올 글 시각으로 전진시킨다 (기존엔 스킵 → "링크만 있으면 안 들어간다" 문제).
         let resolvedFromLink = false;
-        const linkedUrl = extractLinkedCafeUrl(detail.content);
-        if (linkedUrl) {
-          const ref = await resolveCafeArticleIdFromUrl(page, linkedUrl);
-          if (ref && (!ref.clubId || ref.clubId === CLUB_ID) && ref.articleId !== t.articleId) {
-            // 원본이 이미 적재된 상품이면 = 그 상품의 끌어올림 글 → 원본 재파싱 없이 스킵
-            if (existingIds.has(ref.articleId)) {
+        let repostHandled = false;
+        const linkedUrls = extractLinkedCafeUrls(detail.content);
+        for (const linkedUrl of linkedUrls) {
+          const ref = await withTimeout(resolveCafeArticleIdFromUrl(page, linkedUrl), 60_000, `resolveLink #${t.articleId}`);
+          if (!ref || (ref.clubId && ref.clubId !== CLUB_ID) || ref.articleId === t.articleId) continue;
+
+          await sleep(1500 + Math.floor(Math.random() * 1500));
+          const orig = await withTimeout(scrapeCafeDetail(page, CLUB_ID, ref.articleId), 90_000, `scrapeOrigin #${ref.articleId}`);
+
+          // 원본 작성자가 블록리스트면 끌올 글째로 영구 스킵
+          if (orig && orig.authorNickname && blockedAuthors.has(orig.authorNickname.trim())) {
+            await markIgnored(t.articleId, 'blocked_author', detail.title);
+            console.log(`[CrawlDaemon] ⛔ #${t.articleId} 끌올 원본(#${ref.articleId}) 작성자 블록 — 스킵 캐시 등록`);
+            repostHandled = true;
+            break;
+          }
+
+          if (existingIds.has(ref.articleId)) {
+            // ★ 기적재 원본의 끌올 → 최신 정보로 UPDATE + posted_at 전진
+            const { data: prod } = await sb
+              .from('products')
+              .select('id, posted_at')
+              .eq('cafe_article_id', ref.articleId)
+              .maybeSingle();
+            const newPostedAt = detail.postedAt || new Date().toISOString();
+            const prevPostedMs = prod?.posted_at ? new Date(prod.posted_at).getTime() : 0;
+
+            if (prod && new Date(newPostedAt).getTime() > prevPostedMs) {
+              const upd: Record<string, unknown> = {
+                posted_at: newPostedAt,
+                is_active: true,
+              };
+              if (orig && orig.sourcePrice !== null) {
+                upd.source_price = orig.sourcePrice;
+                upd.fee = orig.fee;
+                upd.price = orig.sourcePrice + orig.fee;
+                upd.content = orig.content;
+                // 파싱값이 비어있으면 필드 제외 — 어드민 수동 보정값 보호
+                if (orig.sizes) upd.sizes = orig.sizes;
+                if (orig.colors) upd.colors = orig.colors;
+                if (orig.authorNickname) upd.author_nickname = orig.authorNickname.trim();
+                upd.is_soldout = detectSoldoutFromTitle(detail.title) || detectSoldoutFromTitle(orig.title);
+                // 가격 변동 시 dedup_key 재계산 (충돌 시 키 갱신만 생략)
+                const newKey = buildDedupKey(orig.title, orig.sourcePrice);
+                const { error: keyErr } = await sb.from('products').update({ dedup_key: newKey }).eq('id', prod.id).neq('dedup_key', newKey);
+                if (keyErr && keyErr.code === '23505') {
+                  warnings.push(`#${ref.articleId} dedup_key 재계산 충돌 — 키 갱신 생략`);
+                } else if (keyErr && keyErr.code !== '23505') {
+                  warnings.push(`#${ref.articleId} dedup_key 갱신 실패: ${keyErr.message}`);
+                }
+              }
+              const { error: upErr } = await sb.from('products').update(upd).eq('id', prod.id);
+              if (upErr) {
+                failed++;
+                warnings.push(`#${t.articleId} 끌올 갱신 실패(원본 #${ref.articleId}): ${upErr.message}`);
+              } else {
+                if (orig && orig.imageUrls.length > 0) {
+                  await sb.from('product_images').delete().eq('product_id', prod.id);
+                  const { error: imgErr } = await sb.from('product_images').insert(
+                    orig.imageUrls.map((url, idx) => ({ product_id: prod.id, image_url: url, display_order: idx }))
+                  );
+                  if (imgErr) warnings.push(`#${t.articleId} 끌올 이미지 적재 실패: ${imgErr.message}`);
+                }
+                reposted++;
+                dupeStreak = 0;
+                console.log(`[CrawlDaemon] ⤴️ 끌올 갱신: 원본 #${ref.articleId} posted_at 전진 (끌올 글 #${t.articleId}${orig && orig.sourcePrice !== null ? `, 가격 ${orig.sourcePrice}+${orig.fee}` : ', 라이트 갱신'})`);
+              }
+            } else {
+              // 과거 끌올 재관측 — 기존 중복 의미 유지
               skipped++;
               dupeStreak++;
-              console.log(`[CrawlDaemon] ⤴️ #${t.articleId} 끌어올림 (원본 #${ref.articleId} 기적재) — 스킵`);
-              if (stopAfterDupes > 0 && dupeStreak >= stopAfterDupes) {
-                console.log(`[CrawlDaemon] ⏹ 연속 중복 ${dupeStreak}건 — "중복 전까지" 조기 종료 (마지막 #${t.articleId})`);
-                warnings.push(`연속 중복 ${dupeStreak}건으로 조기 종료 (#${t.articleId}에서 중단)`);
-                break;
-              }
-              continue;
+              console.log(`[CrawlDaemon] ⤴️ #${t.articleId} 끌어올림 (원본 #${ref.articleId} 최신 아님) — 스킵`);
             }
-            await sleep(1500 + Math.floor(Math.random() * 1500));
-            const orig = await scrapeCafeDetail(page, CLUB_ID, ref.articleId);
-            if (orig && orig.sourcePrice !== null) {
-              detail.sourcePrice = orig.sourcePrice;
-              detail.fee = orig.fee;
-              detail.content = orig.content;
-              if (orig.imageUrls.length > 0) detail.imageUrls = orig.imageUrls;
-              if (!detail.sizes) detail.sizes = orig.sizes;
-              if (!detail.authorNickname) detail.authorNickname = orig.authorNickname;
-              resolvedFromLink = true;
-              console.log(`[CrawlDaemon] #${t.articleId} 링크 원본(#${ref.articleId})에서 가격 회수: ${orig.sourcePrice}+${orig.fee}`);
-            }
+            // 처리 완료한 끌올 글 자체는 재진입 방지 캐시 (같은 상품의 새 끌올은 새 articleId로 옴)
+            await markIgnored(t.articleId, 'link_repost_done', detail.title);
+            repostHandled = true;
+            break;
+          }
+
+          // 원본 미적재 → 원본 값을 이식해 아래 신규 INSERT 경로로 진행
+          if (orig && orig.sourcePrice !== null) {
+            detail.sourcePrice = orig.sourcePrice;
+            detail.fee = orig.fee;
+            detail.content = orig.content;
+            if (orig.imageUrls.length > 0) detail.imageUrls = orig.imageUrls;
+            if (!detail.sizes) detail.sizes = orig.sizes;
+            if (!detail.colors) detail.colors = orig.colors;
+            if (!detail.authorNickname) detail.authorNickname = orig.authorNickname;
+            resolvedFromLink = true;
+            console.log(`[CrawlDaemon] #${t.articleId} 링크 원본(#${ref.articleId})에서 가격 회수: ${orig.sourcePrice}+${orig.fee}`);
+            break;
           }
         }
+
+        if (repostHandled) {
+          if (stopAfterDupes > 0 && dupeStreak >= stopAfterDupes) {
+            console.log(`[CrawlDaemon] ⏹ 연속 중복 ${dupeStreak}건 — "중복 전까지" 조기 종료 (마지막 #${t.articleId})`);
+            warnings.push(`연속 중복 ${dupeStreak}건으로 조기 종료 (#${t.articleId}에서 중단)`);
+            break;
+          }
+          continue;
+        }
+
         if (!resolvedFromLink) {
           failed++;
           warnings.push(`#${t.articleId} 가격 파싱 실패: "${detail.title.slice(0, 40)}"`);
           // 가격도 없고 끌어올림 링크도 없으면 = 출석/후기 등 비상품 글 → 영구 스킵 캐시에 등록(다음 사이클 재방문 차단).
           // 링크는 있으나 원본 회수만 실패한 경우는 일시적일 수 있어 캐시하지 않는다.
-          if (!linkedUrl) {
-            const { error: ignErr } = await sb
-              .from('crawl_ignored_articles')
-              .upsert(
-                { cafe_article_id: t.articleId, reason: 'no_price', title: detail.title.slice(0, 200) },
-                { onConflict: 'cafe_article_id' }
-              );
-            if (ignErr) {
-              warnings.push(`#${t.articleId} 비상품 캐시 등록 실패: ${ignErr.message}`);
-            } else {
-              ignoredIds.add(t.articleId);
-              console.log(`[CrawlDaemon] 🚫 #${t.articleId} 비상품(가격·링크 없음) → 스킵 캐시 등록: "${detail.title.slice(0, 30)}"`);
-            }
+          if (linkedUrls.length === 0) {
+            await markIgnored(t.articleId, 'no_price', detail.title);
+            console.log(`[CrawlDaemon] 🚫 #${t.articleId} 비상품(가격·링크 없음) → 스킵 캐시 등록: "${detail.title.slice(0, 30)}"`);
           }
           continue;
         }
@@ -310,6 +514,13 @@ async function runCrawl(page: Page, limit = 200, stopAfterDupes = 0): Promise<Cr
       const authorNickname = detail.authorNickname ? detail.authorNickname.trim() : null;
       const managerId = authorNickname ? managerMap.get(authorNickname) || null : null;
       const titleSoldout = detectSoldoutFromTitle(detail.title); // 제목 품절 표기 → 자동 품절
+
+      // 최종 블록 가드 — 링크 경로에서 닉네임이 뒤늦게 채워진 경우 대비
+      if (authorNickname && blockedAuthors.has(authorNickname)) {
+        await markIgnored(t.articleId, 'blocked_author', detail.title);
+        console.log(`[CrawlDaemon] ⛔ #${t.articleId} 블록 작성자(${authorNickname}) — 적재 직전 차단`);
+        continue;
+      }
 
       // 재게시(끌어올림) 판정
       const { data: existing, error: dupErr } = await sb
@@ -328,19 +539,24 @@ async function runCrawl(page: Page, limit = 200, stopAfterDupes = 0): Promise<Cr
         const prevPostedMs = existing.posted_at ? new Date(existing.posted_at).getTime() : 0;
         if (new Date(postedAt).getTime() > prevPostedMs) {
           // 끌어올림 → 기존 상품을 새 글로 갱신
+          const repostUpd: Record<string, unknown> = {
+            cafe_article_id: t.articleId,
+            naver_article_url: articleUrl,
+            posted_at: postedAt,
+            is_active: true,
+            source_price: sourcePrice,
+            fee: detail.fee,
+            price,
+            content: detail.content,
+            author_nickname: authorNickname,
+            is_soldout: titleSoldout, // 재게시 제목 기준 품절 동기화 (표기 빠지면 해제)
+          };
+          // 옵션은 파싱값이 있을 때만 갱신 — 빈 값으로 어드민 수동 보정을 덮지 않음
+          if (detail.sizes) repostUpd.sizes = detail.sizes;
+          if (detail.colors) repostUpd.colors = detail.colors;
           const { error: upErr } = await sb
             .from('products')
-            .update({
-              cafe_article_id: t.articleId,
-              naver_article_url: articleUrl,
-              posted_at: postedAt,
-              is_active: true,
-              source_price: sourcePrice,
-              fee: detail.fee,
-              price,
-              author_nickname: authorNickname,
-              is_soldout: titleSoldout, // 재게시 제목 기준 품절 동기화 (표기 빠지면 해제)
-            })
+            .update(repostUpd)
             .eq('id', existing.id);
 
           if (upErr) {
@@ -393,6 +609,7 @@ async function runCrawl(page: Page, limit = 200, stopAfterDupes = 0): Promise<Cr
             fee: detail.fee,
             stock_quantity: 9999,
             sizes: detail.sizes,
+            colors: detail.colors,
             naver_article_url: articleUrl,
             cafe_article_id: t.articleId,
             dedup_key: dedupKey,
@@ -510,11 +727,13 @@ async function createScheduledJob(): Promise<any | null> {
 
 async function processJob(job: any) {
   console.log(`[CrawlDaemon] ▶ 크롤 작업 시작 (job ${job.id}, ${job.trigger_type}, 시도 ${job.attempts})`);
+  currentJobId = job.id;
+  markProgress();
   const page = await getPage();
-  await ensureLogin(page);
+  await withTimeout(ensureLogin(page), 180_000, 'ensureLogin');
   const limit = (job.payload && job.payload.limit) || 200;
   const stopAfterDupes = (job.payload && job.payload.stopAfterDupes) || 0;
-  const result = await runCrawl(page, limit, stopAfterDupes);
+  const result = await runCrawl(page, job.id, limit, stopAfterDupes);
   await sb
     .from('crawl_queue')
     .update({ status: 'DONE', result, error: null, updated_at: new Date().toISOString() })
@@ -532,10 +751,17 @@ async function loop() {
   console.log('[CrawlDaemon] 🟢 네이버 카페 크롤러 데몬 시작. 큐 폴링 중... (Ctrl+C 종료)');
   console.log('[CrawlDaemon] 카페 clubId:', CLUB_ID, '/ 프로필 경로:', process.env.NAVER_PROFILE_DIR);
 
+  // 기동 직후 좀비 PROCESSING 회수 — 이전 프로세스가 hang 중 죽었어도 자동 크롤 재개 가능하게
+  await recoverStaleJobs();
+  startWatchdog();
+
   let lastScheduledAt = Date.now(); // 기동 후 10분 뒤 첫 자동 크롤
 
   while (true) {
     try {
+      markProgress(); // idle 폴링도 진행으로 간주 (watchdog은 작업 중일 때만 무진행 판정)
+      await recoverStaleJobs();
+
       // (A) 수동(MANUAL) 큐 작업 우선 claim
       let job = await claimJob();
 
@@ -556,7 +782,9 @@ async function loop() {
 
       try {
         await processJob(job);
+        currentJobId = null;
       } catch (e: any) {
+        currentJobId = null;
         const isFinal = job.attempts >= (job.max_attempts || 3);
         await sb
           .from('crawl_queue')

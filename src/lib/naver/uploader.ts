@@ -4,6 +4,7 @@ import path from 'path';
 import axios from 'axios';
 
 interface UploadPayload {
+  type?: 'NEW' | 'REPOST';
   title: string;
   content: string;
   price: number;
@@ -432,8 +433,10 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
       if (el) el.blur();
     }, titleSelector);
 
-    // 본문 작성 (최상단에 상품번호를 고정 노출하고, 설명 + 상품 고유번호 + 주문서 링크 결합)
-    const formattedContent = `[상품번호: ${payload.productCode}]
+    // 재업은 판매자가 작성한 원문만 유지한다. 상품번호·주문 링크 등 쇼핑몰 자동 문구는 신규 포스팅에만 사용한다.
+    const formattedContent = payload.type === 'REPOST'
+      ? payload.content.trim()
+      : `[상품번호: ${payload.productCode}]
 
 ${payload.content}
 

@@ -88,7 +88,12 @@ async function processJob(job: any) {
   const p = job.payload;
   const kind = p.type === 'REPOST' ? '재업(끌올)' : '신규 포스팅';
   console.log(`[Daemon] ▶ ${kind}: "${p.title}" (job ${job.id}, 시도 ${job.attempts})`);
-  const result = await uploadToNaverCafe(p);
+  // 처리 중에도 생존 신호를 남겨 실제 hang과 긴 이미지 업로드를 구분한다.
+  const heartbeat = setInterval(() => {
+    void sb.from('posting_queue').update({ updated_at: new Date().toISOString() })
+      .eq('id', job.id).eq('status', 'PROCESSING');
+  }, 30_000);
+  const result = await uploadToNaverCafe(p).finally(() => clearInterval(heartbeat));
   if (result && result !== 'DELEGATED_TO_DAEMON') {
     await sb.from('posting_queue').update({ status: 'DONE', result_url: result, error: null, updated_at: new Date().toISOString() }).eq('id', job.id);
     if (p.productId) {

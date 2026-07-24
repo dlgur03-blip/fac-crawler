@@ -533,6 +533,43 @@ function parseAmountToken(token: string): number {
   return parseInt(token.replace(/[.,]/g, ''), 10);
 }
 
+// 제목 가격 폴백 (실측 2026-07-24: 본문에 가격 없이 제목에만 "15000원!!", "20000>>10000원", ">> 만원" 표기하는
+// 셀러 패턴으로 사이클당 45건 파싱 실패 → 누락). '원'이 붙은 금액만 인정 — 맨숫자는 사이즈 나열(110 120 130) 오인 위험.
+const TITLE_AMT = '(\\d{1,3}(?:[.,]\\d{3})+|\\d{4,7})';
+const TITLE_PAIR_RE = new RegExp(`${TITLE_AMT}\\s*(?:>{1,3}|→|⇒)\\s*${TITLE_AMT}\\s*원`);
+const TITLE_WON_RE = new RegExp(`${TITLE_AMT}\\s*원`, 'g');
+const TITLE_MANWON_RE = /(?:^|[^\d.])(\d{1,3}(?:\.\d)?)?\s*만\s*원/;
+
+export function parsePriceFromTitle(title: string): number | null {
+  if (!title) return null;
+  const t = title.replace(/\s+/g, ' ');
+  const inRange = (v: number) => (v >= 1000 && v <= 2000000 ? v : null);
+
+  // 1) "20000>>10000원" 류 할인 표기 — 뒤쪽(최종가) 채택
+  const pair = t.match(TITLE_PAIR_RE);
+  if (pair) {
+    const v = inRange(parseAmountToken(pair[2]));
+    if (v !== null) return v;
+  }
+
+  // 2) "N원" — 여러 개면 마지막(정상가→최종가 순 표기 관행)
+  const wonMatches = [...t.matchAll(TITLE_WON_RE)];
+  for (let i = wonMatches.length - 1; i >= 0; i--) {
+    const v = inRange(parseAmountToken(wonMatches[i][1]));
+    if (v !== null) return v;
+  }
+
+  // 3) "1.5만원" / "만원"(숫자 생략 = 1만)
+  const man = t.match(TITLE_MANWON_RE);
+  if (man) {
+    const n = man[1] ? parseFloat(man[1]) : 1;
+    const v = inRange(Math.round(n * 10000));
+    if (v !== null) return v;
+  }
+
+  return null;
+}
+
 function parsePriceAndFee(content: string): { sourcePrice: number | null; fee: number } {
   const lines = content.split('\n');
 
@@ -935,7 +972,15 @@ export async function scrapeCafeDetail(
       return null;
     }
 
-    const { sourcePrice, fee } = parsePriceAndFee(data.content);
+    let { sourcePrice, fee } = parsePriceAndFee(data.content);
+    if (sourcePrice === null) {
+      // 본문에 가격이 없으면 제목에서 폴백 ("15000원!!", "20000>>10000원" 등) — 수수료는 0으로 간주
+      const titlePrice = parsePriceFromTitle(data.title);
+      if (titlePrice !== null) {
+        sourcePrice = titlePrice;
+        fee = 0;
+      }
+    }
     const postedAt = parsePostedAtText(data.postedAtRaw);
     const { sizes, colors } = parseOptions(data.title, data.content);
 

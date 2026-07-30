@@ -1,5 +1,8 @@
 node_modules/
 .env.local
-.naver_profile/
+# 크롬 프로필(네이버 세션 쿠키 포함) — 공개 레포이므로 절대 커밋되면 안 된다.
+# 기존 `.naver_profile/` 패턴은 `.naver_profile_poster/`를 매치하지 않아 포스터 프로필이
+# 동기화 스크립트의 git add -A에 걸릴 수 있었다 (2026-07-30 수정)
+.naver_profile*
 *.log
 .DS_Store

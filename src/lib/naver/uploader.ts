@@ -2,6 +2,7 @@ import puppeteer, { Page } from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
 import axios from 'axios';
+import { uploadDiagnosticScreenshot } from './diagnostics';
 
 interface UploadPayload {
   type?: 'NEW' | 'REPOST';
@@ -12,6 +13,167 @@ interface UploadPayload {
   imageUrls: string[];
   orderUrl: string;
   productId?: string;
+}
+
+/* ============================================================
+ * 실패 진단 레코더 (2026-07-30)
+ *
+ * uploadToNaverCafe()는 하위호환을 위해 계속 string|null을 반환하지만(호출부 2곳),
+ * 그 null이 "어느 단계에서" 왜 발생했는지를 여기에 기록해 데몬이 DB에 남길 수 있게 한다.
+ *
+ * 모듈 레벨 단일 슬롯이라 동시 실행되면 서로 덮어쓴다 — 포스터 데몬은 posting_queue를
+ * 원자적으로 1건씩 claim해 순차 처리하므로 안전하다(naver-poster-daemon.ts의 claimJob).
+ * 동시 업로드를 도입할 때는 이 구조를 반드시 함께 바꿔야 한다.
+ * ============================================================ */
+
+/** 업로드 진행 단계 — 실패 시 어디까지 갔는지 식별 */
+export type UploadStage =
+  | 'LOGIN'        // 네이버 로그인
+  | 'CAFE_ENTER'   // 카페 글쓰기 페이지 진입 (멤버 권한 검증 포함)
+  | 'BOARD_SELECT' // 게시판 선택
+  | 'TITLE'        // 제목 입력
+  | 'CONTENT'      // 본문 에디터 입력
+  | 'IMAGE'        // 이미지 업로드
+  | 'REGISTER'     // 등록 버튼 클릭
+  | 'VERIFY';      // 등록 결과 URL 검증
+
+export interface UploadDiagnostics {
+  stage: UploadStage;
+  /** 기계 판독용 사유 코드 */
+  reason:
+    | 'LOGIN_FAILED'
+    | 'CAPTCHA'
+    | 'DEVICE_CONFIRM'
+    | 'NO_CREDENTIALS'
+    | 'MEMBERSHIP'
+    | 'TIMEOUT'
+    | 'STILL_ON_WRITE_FORM'
+    | 'EXCEPTION'
+    | 'UNKNOWN';
+  message: string;
+  pageUrl?: string;
+  pageTitle?: string;
+  captcha?: boolean;
+  deviceConfirm?: boolean;
+  /** daemon-diagnostics 버킷 내 스크린샷 경로 */
+  screenshotPath?: string | null;
+  at: string;
+}
+
+let currentStage: UploadStage = 'LOGIN';
+let lastDiagnostics: UploadDiagnostics | null = null;
+/** loginToNaver가 감지한 캡차/기기확인 신호 (uploadToNaverCafe 실패 진단에 합류) */
+let loginSignals: { captcha: boolean; deviceConfirm: boolean; note: string } = {
+  captcha: false,
+  deviceConfirm: false,
+  note: ''
+};
+
+function setStage(stage: UploadStage) {
+  currentStage = stage;
+  console.log(`[Uploader] ▷ 단계: ${stage}`);
+}
+
+/** 직전 uploadToNaverCafe / ensurePosterSession 실패의 진단 정보 (없으면 null) */
+export function getLastUploadDiagnostics(): UploadDiagnostics | null {
+  return lastDiagnostics;
+}
+
+/** 로그인 페이지의 캡차·기기확인 흔적을 실제로 검사한다 (기존에는 감지 코드가 전무했음) */
+async function inspectLoginBlockers(page: Page): Promise<{ captcha: boolean; deviceConfirm: boolean; url: string; title: string }> {
+  let url = '';
+  let title = '';
+  let captcha = false;
+  let deviceConfirm = false;
+  try {
+    url = page.url();
+    title = await page.title().catch(() => '');
+    const probe = await page.evaluate(() => {
+      const hasCaptcha = !!document.querySelector('#captchaimg, #chptcha, .captcha_wrap, [id*="captcha"], [class*="captcha"]');
+      const bodyText = (document.body?.innerText || '').slice(0, 3000);
+      return { hasCaptcha, bodyText };
+    });
+    captcha = probe.hasCaptcha || /보안문자|자동입력 방지/.test(probe.bodyText);
+    deviceConfirm =
+      /deviceConfirm|need2|otp|sso\/finalize|nidlogin\.login/i.test(url) ||
+      /새로운 기기|기기 확인|2단계 인증|본인 확인/.test(probe.bodyText);
+  } catch {
+    /* 페이지가 이미 닫힌 경우 등 — 감지 불가로 처리 */
+  }
+  return { captcha, deviceConfirm, url, title };
+}
+
+/** 실패 진단을 기록하고, 가능하면 스크린샷을 비공개 버킷에 올린다 */
+async function recordDiagnostics(
+  page: Page | null,
+  reason: UploadDiagnostics['reason'],
+  message: string,
+  stage: UploadStage = currentStage
+): Promise<UploadDiagnostics> {
+  const diag: UploadDiagnostics = {
+    stage,
+    reason,
+    message: String(message || '').slice(0, 1000),
+    captcha: loginSignals.captcha || undefined,
+    deviceConfirm: loginSignals.deviceConfirm || undefined,
+    screenshotPath: null,
+    at: new Date().toISOString()
+  };
+
+  if (page) {
+    try {
+      diag.pageUrl = page.url();
+      diag.pageTitle = await page.title().catch(() => undefined);
+      const buf = (await page.screenshot({ type: 'jpeg', quality: 70 })) as Buffer;
+      diag.screenshotPath = await uploadDiagnosticScreenshot(buf, 'poster', `${stage}-${reason}`);
+      // 업로드 실패 시 로컬 폴백 (윈도우 PC에서 직접 볼 수 있게)
+      if (!diag.screenshotPath) {
+        const fallback = path.join(process.cwd(), 'error_screenshot.png');
+        await page.screenshot({ path: fallback }).catch(() => {});
+        console.log(`[Uploader] 진단 스크린샷 로컬 폴백 저장: ${fallback}`);
+      }
+    } catch (ssErr: any) {
+      console.warn('[Uploader] 진단 스크린샷 처리 실패:', ssErr?.message || ssErr);
+    }
+  }
+
+  lastDiagnostics = diag;
+  console.error(
+    `[Uploader] ❌ 진단 기록 — stage=${diag.stage} reason=${diag.reason}` +
+      `${diag.captcha ? ' captcha=true' : ''}${diag.deviceConfirm ? ' deviceConfirm=true' : ''} url=${diag.pageUrl || '-'}`
+  );
+  return diag;
+}
+
+/** 사람이 읽을 한 줄 요약 (posting_queue.error에 저장됨) */
+export function describeDiagnostics(diag: UploadDiagnostics | null): string {
+  if (!diag) return '포스팅 결과 URL을 받지 못함 (진단 정보 없음)';
+  const stageLabel: Record<UploadStage, string> = {
+    LOGIN: '네이버 로그인',
+    CAFE_ENTER: '카페 글쓰기 진입',
+    BOARD_SELECT: '게시판 선택',
+    TITLE: '제목 입력',
+    CONTENT: '본문 입력',
+    IMAGE: '이미지 업로드',
+    REGISTER: '등록 버튼',
+    VERIFY: '등록 결과 검증'
+  };
+  const extra = diag.deviceConfirm ? ' — 기기확인/2단계 인증 화면 감지' : diag.captcha ? ' — 캡차(보안문자) 감지' : '';
+  return `${stageLabel[diag.stage]} 단계 실패${extra}: ${diag.message}`.slice(0, 500);
+}
+
+/** 로그인 단계 실패인지 (재시도해도 무의미 → 데몬이 즉시 중단 판단에 사용) */
+export function isLoginBlocked(diag: UploadDiagnostics | null): boolean {
+  if (!diag) return false;
+  return (
+    diag.stage === 'LOGIN' ||
+    diag.reason === 'LOGIN_FAILED' ||
+    diag.reason === 'CAPTCHA' ||
+    diag.reason === 'DEVICE_CONFIRM' ||
+    diag.reason === 'NO_CREDENTIALS' ||
+    !!diag.captcha ||
+    !!diag.deviceConfirm
+  );
 }
 
 /**
@@ -100,8 +262,12 @@ export async function loginToNaver(page: Page): Promise<boolean> {
   const username = process.env.NAVER_USER_ID || '';
   const password = process.env.NAVER_USER_PW || '';
 
+  // 이번 로그인 시도의 차단 신호 초기화
+  loginSignals = { captcha: false, deviceConfirm: false, note: '' };
+
   if (!username || !password) {
     console.error('[Uploader] 네이버 로그인 환경변수(NAVER_USER_ID, NAVER_USER_PW)가 누락되었습니다.');
+    loginSignals.note = 'NO_CREDENTIALS';
     return false;
   }
 
@@ -150,13 +316,72 @@ export async function loginToNaver(page: Page): Promise<boolean> {
   // 쿠키 확인 등으로 로그인 검증
   const cookies = await page.cookies();
   const isLoggedIn = cookies.some((c) => c.name === 'NID_SES' || c.name === 'NID_AUT');
-  
+
   if (isLoggedIn) {
     console.log('[Uploader] 네이버 로그인 성공!');
     return true;
-  } else {
-    console.error('[Uploader] 네이버 로그인 실패. 캡차 보안문자가 나타났거나 계정 정보가 유효하지 않습니다.');
-    return false;
+  }
+
+  // 실패 원인을 추측 문구로 남기지 않고 실제 화면을 검사한다 (캡차/기기확인 감지)
+  const blockers = await inspectLoginBlockers(page);
+  loginSignals.captcha = blockers.captcha;
+  loginSignals.deviceConfirm = blockers.deviceConfirm;
+  loginSignals.note = blockers.captcha
+    ? 'CAPTCHA'
+    : blockers.deviceConfirm
+      ? 'DEVICE_CONFIRM'
+      : 'LOGIN_FAILED';
+  console.error(
+    `[Uploader] 네이버 로그인 실패 — captcha=${blockers.captcha} deviceConfirm=${blockers.deviceConfirm} ` +
+      `url=${blockers.url} title="${blockers.title}"`
+  );
+  return false;
+}
+
+/**
+ * 세션 워밍업 (2026-07-30) — 포스터 데몬이 재업 작업 없이도 주기적으로 호출한다.
+ *
+ * 배경: 포스터는 작업이 있을 때만 브라우저를 띄우므로(크롤러는 10분마다 상시 접속) 세션이
+ * 오래 방치되면 네이버가 기기확인/캡차를 요구한다. 실제 재업 요청이 들어온 순간에야 그 사실을
+ * 알게 되어 주문 대응이 늦어졌다. 주기적으로 세션을 갱신하고, 깨졌으면 미리 알린다.
+ */
+export async function ensurePosterSession(): Promise<{ ok: boolean; diagnostics: UploadDiagnostics | null }> {
+  lastDiagnostics = null;
+  setStage('LOGIN');
+
+  const browser = await puppeteer.launch({
+    headless: process.env.NAVER_HEADLESS === 'false' ? false : true,
+    protocolTimeout: 120_000,
+    userDataDir: process.env.NAVER_PROFILE_DIR || undefined,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,1024', '--disable-blink-features=AutomationControlled'],
+  });
+
+  let page: Page | null = null;
+  try {
+    page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 1024 });
+    await page.setUserAgent(
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
+
+    const ok = await loginToNaver(page);
+    if (!ok) {
+      const reason: UploadDiagnostics['reason'] =
+        loginSignals.note === 'CAPTCHA' ? 'CAPTCHA'
+        : loginSignals.note === 'DEVICE_CONFIRM' ? 'DEVICE_CONFIRM'
+        : loginSignals.note === 'NO_CREDENTIALS' ? 'NO_CREDENTIALS'
+        : 'LOGIN_FAILED';
+      const diag = await recordDiagnostics(page, reason, '세션 점검 중 로그인 실패 — 수동 재로그인이 필요합니다.', 'LOGIN');
+      return { ok: false, diagnostics: diag };
+    }
+
+    console.log('[Uploader] ✅ 포스터 세션 정상 (주기 점검 통과)');
+    return { ok: true, diagnostics: null };
+  } catch (err: any) {
+    const diag = await recordDiagnostics(page, 'EXCEPTION', `세션 점검 예외: ${err?.message || err}`, 'LOGIN');
+    return { ok: false, diagnostics: diag };
+  } finally {
+    await browser.close().catch(() => {});
   }
 }
 
@@ -201,6 +426,10 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
   }
 
   console.log(`[Uploader] 카페 자동 포스팅 시작: ${payload.title}`);
+
+  // 이번 시도의 진단 슬롯 초기화 (데몬이 실패 후 getLastUploadDiagnostics()로 읽는다)
+  lastDiagnostics = null;
+  setStage('LOGIN');
 
   // 1) 로컬에 이미지 다운로드
   const localImagePaths = await downloadImagesToLocal(payload.imageUrls, payload.productCode);
@@ -249,12 +478,20 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
     // 2) 네이버 로그인
     const loggedIn = await loginToNaver(page);
     if (!loggedIn) {
+      // 기존에는 로그 한 줄 없이 null만 반환해 원인 파악이 불가능했다 (2026-07-30 장애)
+      const reason: UploadDiagnostics['reason'] =
+        loginSignals.note === 'CAPTCHA' ? 'CAPTCHA'
+        : loginSignals.note === 'DEVICE_CONFIRM' ? 'DEVICE_CONFIRM'
+        : loginSignals.note === 'NO_CREDENTIALS' ? 'NO_CREDENTIALS'
+        : 'LOGIN_FAILED';
+      await recordDiagnostics(page, reason, '네이버 로그인에 실패했습니다. 창을 띄워(NAVER_HEADLESS=false) 수동 로그인이 필요합니다.', 'LOGIN');
       await browser.close();
       cleanLocalTempImages(localImagePaths);
       return null;
     }
 
     // 3) 모바일 글쓰기 페이지로 이동 (iframe 우회를 위해 모바일 버전 글쓰기 폼 활용)
+    setStage('CAFE_ENTER');
     const writeUrl = `https://m.cafe.naver.com/ca-fe/web/cafes/${targetCafeId}/articles/write`;
     console.log(`[Uploader] 카페 글쓰기 페이지 이동 중: ${writeUrl}`);
     await page.goto(writeUrl, { waitUntil: 'domcontentloaded' });
@@ -273,8 +510,9 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
 
     // 4) 글쓰기 폼 세팅
     console.log('[Uploader] 제목 및 본문 템플릿 입력 중...');
-    
+
     // 🚨 게시판 선택 로직 개선 (물리 클릭 및 드롭다운 오픈 락인 가드 & 자가치유 폴백 패턴 완벽 주입)
+    setStage('BOARD_SELECT');
     console.log('[Uploader] 게시판 선택 영역 활성화 시도 중...');
     const selectBoxSelector = '.selectbox, [class*="selectbox"]';
     await page.waitForSelector(selectBoxSelector, { timeout: 10000 });
@@ -414,6 +652,7 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
     await new Promise((resolve) => setTimeout(resolve, 2000));
 
     // 모바일 글쓰기 제목 셀렉터 찾기 (Vue 컴포넌트인 textarea[placeholder="제목"] 우선 적용)
+    setStage('TITLE');
     const titleSelector = 'textarea[placeholder="제목"], .ArticleWriteFormSubject textarea, .input_title, input#subject';
     await page.waitForSelector(titleSelector, { timeout: 10000 });
     await page.click(titleSelector);
@@ -452,6 +691,7 @@ ${payload.content}
 
     // 본문 에디터 영역 셀렉터 (스마트에디터 ONE 모바일용 contenteditable 캔버스 우선)
     // 🚨 덤프 분석을 통해 확인된 __se-scroll-target 내부의 contenteditable을 최우선 매칭하여 제목과의 겹침 오염 차단
+    setStage('CONTENT');
     const contentSelector = '.__se-scroll-target [contenteditable="true"], .se-content [contenteditable="true"], .se-canvas [contenteditable="true"], #one-editor [contenteditable="true"], .textarea_content, textarea#content';
     await page.waitForSelector(contentSelector, { timeout: 10000 });
     
@@ -625,6 +865,7 @@ ${payload.content}
 
     // 5) 이미지 업로드 프로세스
     if (localImagePaths.length > 0) {
+      setStage('IMAGE');
       console.log(`[Uploader] 총 ${localImagePaths.length}장의 실물 사진 업로드 중...`);
       try {
         // 툴바의 사진 업로드 버튼 (.se-image-toolbar-button) 대기 및 클릭
@@ -657,6 +898,7 @@ ${payload.content}
     }
 
     // 6) 최종 "등록" 버튼 클릭
+    setStage('REGISTER');
     console.log('[Uploader] 글 등록 완료 중...');
     // GnbBntRight__green 클래스가 모바일 GNB 등록 버튼
     const registerBtnSelector = '.GnbBntRight__green, .btn_register, .btn_upload, button.submit, button[type="submit"]';
@@ -675,10 +917,8 @@ ${payload.content}
       }
     }, registerBtnSelector);
 
-    // 등록 버튼 누르고 5초간 대기하며 페이지 상태를 정밀 스크린샷으로 캡처
+    // 등록 버튼 누르고 5초 대기 (기존의 로컬 고정파일 스크린샷은 제거 — 실패 시에만 버킷에 올린다)
     await new Promise((resolve) => setTimeout(resolve, 5000));
-    await page.screenshot({ path: path.join(process.cwd(), 'after_register_click.png') });
-    console.log('[Uploader] 등록 클릭 5초 후 스크린샷 after_register_click.png 저장 완료.');
 
     // 완료 내비게이션 대기
     await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {
@@ -686,6 +926,7 @@ ${payload.content}
     });
 
     // 7) 등록 완료된 글 URL 파싱 및 오류 검증
+    setStage('VERIFY');
     const finalUrl = page.url();
     console.log(`[Uploader] 최종 리다이렉트 URL 확인: ${finalUrl}`);
     
@@ -699,18 +940,20 @@ ${payload.content}
     cleanLocalTempImages(localImagePaths);
     await browser.close();
     return finalUrl;
-  } catch (err) {
+  } catch (err: any) {
     console.error('[Uploader] 자동 업로드 프로세스 도중 심각한 에러 발생:', err);
-    try {
-      if (page) {
-        await page.screenshot({ path: path.join(process.cwd(), 'error_screenshot.png') });
-        console.log('[Uploader] 에러 시점의 스크린샷이 error_screenshot.png 로 저장되었습니다.');
-      }
-    } catch (ssErr) {
-      console.error('[Uploader] 에러 스크린샷 저장 실패:', ssErr);
-    }
+
+    // 예외 메시지를 삼키지 않고 단계·사유로 분류해 기록한다 (기존에는 전부 null로 소실)
+    const msg = String(err?.message || err || '');
+    const reason: UploadDiagnostics['reason'] =
+      /가입 권한|멤버만|글쓰기 권한/.test(msg) ? 'MEMBERSHIP'
+      : /여전히 글쓰기 폼/.test(msg) ? 'STILL_ON_WRITE_FORM'
+      : /timeout|Waiting for selector|exceeded/i.test(msg) ? 'TIMEOUT'
+      : 'EXCEPTION';
+    await recordDiagnostics(page, reason, msg);
+
     cleanLocalTempImages(localImagePaths);
-    await browser.close();
+    await browser.close().catch(() => {});
     return null;
   }
 }

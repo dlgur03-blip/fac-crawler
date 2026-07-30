@@ -18,6 +18,7 @@
 import fs from 'fs';
 import path from 'path';
 import { createClient } from '@supabase/supabase-js';
+import { reportDaemonStatus } from '../src/lib/naver/daemon-status';
 
 // ---- .env.local 로드 (dotenv 없이 간단 파싱) ----
 (function loadEnv() {
@@ -62,7 +63,25 @@ if (!SUPA_URL || !SVC) {
 const sb = createClient(SUPA_URL, SVC, { auth: { persistSession: false } });
 
 const POLL_MS = 10_000;
+const HEARTBEAT_MS = 60_000; // idle 상태에서도 생존 신호를 남기는 주기
+// 포스터는 작업이 있을 때만 브라우저를 띄우므로 세션이 방치되면 네이버가 기기확인을 요구한다.
+// 작업이 없어도 주기적으로 로그인 세션을 갱신해 "재업 요청 순간에야 로그인 깨진 걸 알게 되는" 상황을 막는다.
+const SESSION_REFRESH_MS = Math.max(1, Number(process.env.SESSION_REFRESH_HOURS || 6)) * 60 * 60 * 1000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+let lastHeartbeatAt = 0;
+let lastSessionCheckAt = 0;
+let loginRequired = false; // 로그인 차단 감지 시 true — 세션 복구되면 해제
+
+/** idle/working 생존 신호 (실패는 조용히 무시 — 본작업을 막지 않는다) */
+async function beat(state: 'IDLE' | 'WORKING', detail?: Record<string, unknown>) {
+  lastHeartbeatAt = Date.now();
+  await reportDaemonStatus({
+    name: 'poster',
+    state: loginRequired ? 'LOGIN_REQUIRED' : state,
+    detail: { postCafeId: POST_CAFE_ID, ...(detail || {}) }
+  });
+}
 
 async function claimJob(): Promise<any | null> {
   const { data: jobs } = await sb
@@ -83,8 +102,17 @@ async function claimJob(): Promise<any | null> {
   return claimed && claimed.length ? claimed[0] : null;
 }
 
+/** 진단 정보를 실어 나르는 에러 — loop가 로그인 차단 여부를 판단해 즉시 중단할 수 있게 한다 */
+class PostFailure extends Error {
+  diag: any;
+  constructor(message: string, diag: any) {
+    super(message);
+    this.diag = diag;
+  }
+}
+
 async function processJob(job: any) {
-  const { uploadToNaverCafe } = await import('../src/lib/naver/uploader');
+  const { uploadToNaverCafe, getLastUploadDiagnostics, describeDiagnostics } = await import('../src/lib/naver/uploader');
   const p = job.payload;
   const kind = p.type === 'REPOST' ? '재업(끌올)' : '신규 포스팅';
   console.log(`[Daemon] ▶ ${kind}: "${p.title}" (job ${job.id}, 시도 ${job.attempts})`);
@@ -92,7 +120,9 @@ async function processJob(job: any) {
   const heartbeat = setInterval(() => {
     void sb.from('posting_queue').update({ updated_at: new Date().toISOString() })
       .eq('id', job.id).eq('status', 'PROCESSING');
+    void beat('WORKING', { jobId: job.id, title: p.title });
   }, 30_000);
+  await beat('WORKING', { jobId: job.id, title: p.title });
   const result = await uploadToNaverCafe(p).finally(() => clearInterval(heartbeat));
   if (result && result !== 'DELEGATED_TO_DAEMON') {
     await sb.from('posting_queue').update({ status: 'DONE', result_url: result, error: null, updated_at: new Date().toISOString() }).eq('id', job.id);
@@ -110,31 +140,99 @@ async function processJob(job: any) {
       if (prodErr) console.warn(`[Daemon] ⚠️ 상품 갱신 실패 (product ${p.productId}): ${prodErr.message}`);
     }
     console.log(`[Daemon] ✅ 완료 → ${result}`);
+    loginRequired = false;
+    await reportDaemonStatus({ name: 'poster', state: 'IDLE', markSuccess: true, lastError: null, detail: { lastResultUrl: result } });
   } else {
-    throw new Error('포스팅 결과 URL을 받지 못함 (멤버 권한/캡차/로그인 실패 가능)');
+    // 실패 원인을 uploader가 남긴 진단으로 특정한다 (기존에는 한 줄 추측 문구만 남았음)
+    const diag = getLastUploadDiagnostics();
+    throw new PostFailure(describeDiagnostics(diag), diag);
+  }
+}
+
+/**
+ * 세션 주기 점검 — 작업이 없어도 로그인 세션을 살려두고, 깨졌으면 즉시 알린다.
+ * (대표님 지적: "쓸 때만 로그인하니까 텀에 로그인 인증이 걸려버린다")
+ */
+async function refreshSessionIfDue() {
+  if (Date.now() - lastSessionCheckAt < SESSION_REFRESH_MS) return;
+  lastSessionCheckAt = Date.now();
+
+  const { ensurePosterSession, describeDiagnostics } = await import('../src/lib/naver/uploader');
+  console.log('[Daemon] 🔄 로그인 세션 주기 점검 시작...');
+  const { ok, diagnostics } = await ensurePosterSession();
+
+  if (ok) {
+    loginRequired = false;
+    await reportDaemonStatus({ name: 'poster', state: 'IDLE', markLoginCheck: true, lastError: null });
+    console.log('[Daemon] ✅ 세션 정상 — 다음 점검까지 대기');
+  } else {
+    loginRequired = true;
+    await reportDaemonStatus({
+      name: 'poster',
+      state: 'LOGIN_REQUIRED',
+      lastError: describeDiagnostics(diagnostics),
+      detail: { diagnostics, source: 'session-refresh' }
+    });
+    console.error('[Daemon] 🔴 세션 점검 실패 — 수동 재로그인 필요 (NAVER_HEADLESS=false)');
   }
 }
 
 async function loop() {
   console.log('[Daemon] 🟢 네이버 카페 포스팅 데몬 시작. 큐 폴링 중... (Ctrl+C 종료)');
   console.log('[Daemon] 프로필 경로:', process.env.NAVER_PROFILE_DIR);
+  console.log(`[Daemon] 세션 주기 점검: ${SESSION_REFRESH_MS / 3_600_000}시간마다`);
+  await beat('IDLE');
+  // 기동 직후 1회 세션 점검 — 새 PC 설치 후 로그인 상태를 바로 확인할 수 있게 한다
+  await refreshSessionIfDue().catch((e) => console.warn('[Daemon] 초기 세션 점검 실패:', e?.message));
+
   while (true) {
     try {
       const job = await claimJob();
-      if (!job) { await sleep(POLL_MS); continue; }
+      if (!job) {
+        if (Date.now() - lastHeartbeatAt >= HEARTBEAT_MS) await beat('IDLE');
+        await refreshSessionIfDue().catch((e) => console.warn('[Daemon] 세션 점검 실패:', e?.message));
+        await sleep(POLL_MS);
+        continue;
+      }
       try {
         await processJob(job);
       } catch (e: any) {
-        const isFinal = job.attempts >= (job.max_attempts || 3);
+        const diag = e?.diag ?? null;
+        const { isLoginBlocked } = await import('../src/lib/naver/uploader');
+        const blocked = isLoginBlocked(diag);
+
+        // 로그인/캡차 차단은 재시도해도 무조건 실패한다. 3회 헛시도로 계정을 더 자극하지 않고 즉시 중단.
+        const isFinal = blocked || job.attempts >= (job.max_attempts || 3);
         await sb.from('posting_queue').update({
           status: isFinal ? 'FAILED' : 'PENDING',
           error: String(e?.message || e).slice(0, 500),
+          result: diag ? { diagnostics: diag, loginBlocked: blocked } : null,
           updated_at: new Date().toISOString()
         }).eq('id', job.id);
-        if (isFinal) {
-          console.error(`[Daemon] 🔴 최종 실패 (job ${job.id}): ${e?.message} — 관리자 확인 필요`);
+
+        if (blocked) {
+          loginRequired = true;
+          await reportDaemonStatus({
+            name: 'poster',
+            state: 'LOGIN_REQUIRED',
+            lastError: String(e?.message || e),
+            bumpFailure: true,
+            detail: { diagnostics: diag, jobId: job.id, source: 'job' }
+          });
+          console.error(`[Daemon] 🔴 로그인 차단 감지 — 재시도 중단, 수동 재로그인 필요 (job ${job.id}): ${e?.message}`);
         } else {
-          console.warn(`[Daemon] 🟡 실패, 재시도 대기 (job ${job.id}, ${job.attempts}/${job.max_attempts}): ${e?.message}`);
+          await reportDaemonStatus({
+            name: 'poster',
+            state: 'ERROR',
+            lastError: String(e?.message || e),
+            bumpFailure: true,
+            detail: { diagnostics: diag, jobId: job.id, source: 'job' }
+          });
+          if (isFinal) {
+            console.error(`[Daemon] 🔴 최종 실패 (job ${job.id}): ${e?.message} — 관리자 확인 필요`);
+          } else {
+            console.warn(`[Daemon] 🟡 실패, 재시도 대기 (job ${job.id}, ${job.attempts}/${job.max_attempts}): ${e?.message}`);
+          }
         }
       }
     } catch (loopErr: any) {

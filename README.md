@@ -110,6 +110,34 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 | 제거 | `Unregister-ScheduledTask -TaskName "FACTORIES-PosterDaemon" -Confirm:$false` |
 | 로그 | `notepad %USERPROFILE%\fac-crawler\poster-daemon.log` |
 
+### 5. 세션 주기 점검 (2026-07-30 추가)
+포스터는 재업 작업이 있을 때만 로그인하므로, 텀이 길어지면 네이버가 기기확인/캡차를 요구해
+**정작 재업이 필요한 순간에 실패**한다. 이제 데몬이 기동 직후 + `SESSION_REFRESH_HOURS`(기본 6시간)
+마다 세션을 점검하고, 깨졌으면 관리자 화면(`jinshopping.com/admin`)에 **"포스터 로그인 필요"** 로 표시한다.
+- 로그인/캡차 차단으로 판정되면 재시도를 하지 않고 즉시 실패 처리한다(반복 로그인으로 계정을 더 자극하지 않기 위함).
+- 실패 원인은 `posting_queue.result`에 단계(LOGIN/CAFE_ENTER/…/VERIFY)와 캡차·기기확인 여부로 남고,
+  실패 화면 스크린샷은 비공개 버킷(`daemon-diagnostics`)에 올라가 관리자 화면에서 열어볼 수 있다.
+
+## 포스터를 다른 PC로 이전하기
+
+> ⚠️ **가장 중요: 새 PC를 켜기 전에 기존 PC의 포스터 태스크를 반드시 중지한다.**
+> 두 대가 같은 큐를 폴링하면 먼저 집어간 쪽이 처리해버려 새 PC 검증이 불가능하다.
+
+```powershell
+# (기존 PC) 포스터만 중지 — 크롤러(FACTORIES-CrawlerDaemon)는 그대로 둔다
+Stop-ScheduledTask   -TaskName "FACTORIES-PosterDaemon"
+Disable-ScheduledTask -TaskName "FACTORIES-PosterDaemon"
+```
+
+1. 새 PC에 Node.js LTS + git 설치 → `git clone https://github.com/dlgur03-blip/fac-crawler.git` → `npm install`
+2. `.env.local` 준비 — **기존 PC의 `%USERPROFILE%\fac-crawler\.env.local`을 파일째 복사**하는 것이 가장 안전하다
+   (Supabase 키·포스팅 계정이 모두 들어있음). 메모장 저장 시 `.env.local.txt`가 되지 않게 주의.
+3. 첫 로그인 — `set NAVER_HEADLESS=false` 후 `npm run naver-daemon`으로 창을 띄워 캡차/기기확인을 직접 통과
+   (세션이 `.naver_profile_poster`에 저장됨). `🟢 데몬 시작` 확인 후 `Ctrl+C`
+4. 테스트 카페로 1건 재업 검증 → `.env.local`에 `NAVER_POST_CAFE_ID=28310071` 추가해 실카페 전환
+5. `install-poster-task.ps1`로 자동 시작 등록
+6. `jinshopping.com/admin` 최상단 배너에서 **포스터 ONLINE** 표시 확인
+
 ---
 
 ## 관리 명령 (관리자 PowerShell)

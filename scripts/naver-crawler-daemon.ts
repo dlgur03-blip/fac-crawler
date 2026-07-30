@@ -21,6 +21,7 @@ import path from 'path';
 import { createClient } from '@supabase/supabase-js';
 import type { Browser, Page } from 'puppeteer';
 import type { CafeListItem } from '../src/lib/naver/crawler';
+import { reportDaemonStatus } from '../src/lib/naver/daemon-status';
 
 // ---- .env.local 로드 (dotenv 없이 간단 파싱) ----
 (function loadEnv() {
@@ -94,6 +95,8 @@ async function heartbeat(jobId: string, progress: { done: number; total: number 
       .update({ updated_at: new Date().toISOString(), result: { progress } })
       .eq('id', jobId)
       .eq('status', 'PROCESSING');
+    // 데몬 생존 상태도 함께 기록 (관리자 화면의 크롤러/포스터 통합 배너용, 2026-07-30)
+    await reportDaemonStatus({ name: 'crawler', state: 'WORKING', detail: { jobId, progress } });
   } catch { /* heartbeat 실패는 크롤을 막지 않음 */ }
 }
 
@@ -747,6 +750,8 @@ async function processJob(job: any) {
   }
 }
 
+let lastIdleBeatAt = 0; // idle 생존 신호 스로틀
+
 async function loop() {
   console.log('[CrawlDaemon] 🟢 네이버 카페 크롤러 데몬 시작. 큐 폴링 중... (Ctrl+C 종료)');
   console.log('[CrawlDaemon] 카페 clubId:', CLUB_ID, '/ 프로필 경로:', process.env.NAVER_PROFILE_DIR);
@@ -776,6 +781,11 @@ async function loop() {
       }
 
       if (!job) {
+        // idle 상태에서도 생존 신호 (관리자 배너가 크롤러 IDLE/OFFLINE을 구분할 수 있게)
+        if (Date.now() - lastIdleBeatAt >= 60_000) {
+          lastIdleBeatAt = Date.now();
+          await reportDaemonStatus({ name: 'crawler', state: 'IDLE', detail: { clubId: CLUB_ID } });
+        }
         await sleep(POLL_MS);
         continue;
       }

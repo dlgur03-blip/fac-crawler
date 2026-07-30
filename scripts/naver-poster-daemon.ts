@@ -1,7 +1,7 @@
 /**
  * 네이버 카페 포스팅 데몬 (항시 켜둔 머신에서 실행)
  *
- * 동작: Supabase posting_queue 테이블을 폴링 → PENDING 작업을 하나씩 claim →
+ * 동작: Supabase posting_queue 테이블을 폴링 → QUEUED/PENDING 작업을 하나씩 claim →
  *       Puppeteer로 네이버 카페에 포스팅 → 성공 시 DONE + products.naver_article_url 갱신,
  *       실패 시 재시도(attempts < max_attempts) 또는 FAILED.
  *
@@ -83,21 +83,29 @@ async function beat(state: 'IDLE' | 'WORKING', detail?: Record<string, unknown>)
   });
 }
 
+/**
+ * 대기 작업 상태 — 신버전 데몬은 QUEUED와 PENDING을 모두 처리한다.
+ * 신규 작업은 웹에서 QUEUED로 적재되므로 PENDING만 보는 구버전 데몬은 작업을 집어갈 수 없다
+ * (포스터를 다른 PC로 이전할 때 이중 처리 방지용 원격 차단 스위치, 2026-07-30).
+ * PENDING도 함께 폴링하는 이유: 구버전이 남긴 잔여 작업을 새 PC가 이어받을 수 있게.
+ */
+const WAITING_STATUSES = ['QUEUED', 'PENDING'] as const;
+
 async function claimJob(): Promise<any | null> {
   const { data: jobs } = await sb
     .from('posting_queue')
     .select('*')
-    .eq('status', 'PENDING')
+    .in('status', WAITING_STATUSES as unknown as string[])
     .order('created_at', { ascending: true })
     .limit(1);
   if (!jobs || !jobs.length) return null;
   const job = jobs[0];
-  // 원자적 claim: 여전히 PENDING일 때만 PROCESSING으로
+  // 원자적 claim: 여전히 대기 상태일 때만 PROCESSING으로 (다른 데몬과 경합해도 1건만 성공)
   const { data: claimed } = await sb
     .from('posting_queue')
     .update({ status: 'PROCESSING', attempts: job.attempts + 1, updated_at: new Date().toISOString() })
     .eq('id', job.id)
-    .eq('status', 'PENDING')
+    .eq('status', job.status)
     .select();
   return claimed && claimed.length ? claimed[0] : null;
 }
@@ -204,7 +212,8 @@ async function loop() {
         // 로그인/캡차 차단은 재시도해도 무조건 실패한다. 3회 헛시도로 계정을 더 자극하지 않고 즉시 중단.
         const isFinal = blocked || job.attempts >= (job.max_attempts || 3);
         await sb.from('posting_queue').update({
-          status: isFinal ? 'FAILED' : 'PENDING',
+          // 재시도는 QUEUED로 되돌린다 (PENDING이면 구버전 데몬이 가로챌 수 있음)
+          status: isFinal ? 'FAILED' : 'QUEUED',
           error: String(e?.message || e).slice(0, 500),
           result: diag ? { diagnostics: diag, loginBlocked: blocked } : null,
           updated_at: new Date().toISOString()

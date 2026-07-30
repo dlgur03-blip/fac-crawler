@@ -6,3 +6,6 @@ node_modules/
 .naver_profile*
 *.log
 .DS_Store
+
+# 포스팅 시 이미지 임시 저장 디렉토리 (동기화 스크립트의 git add -A에 걸리지 않게)
+temp_uploads/

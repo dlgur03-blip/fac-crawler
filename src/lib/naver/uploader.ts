@@ -1,7 +1,8 @@
-import puppeteer, { Page } from 'puppeteer';
+import puppeteer, { Browser, Page } from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
 import axios from 'axios';
+import { createClient } from '@supabase/supabase-js';
 import { uploadDiagnosticScreenshot } from './diagnostics';
 
 interface UploadPayload {
@@ -301,11 +302,29 @@ export async function loginToNaver(page: Page): Promise<boolean> {
   await new Promise((resolve) => setTimeout(resolve, 1000));
   
   // 로그인 버튼 클릭
-  const loginBtn = await page.$('#log\\.login');
-  if (loginBtn) {
-    await loginBtn.click();
+  // 네이버가 로그인 폼을 반응형으로 개편해(2026-07-30 확인) 기존 #log.login / .btn_login이 모두
+  // 사라졌다. 현재는 #loginBtn_row(넓은 화면 표시)와 #loginBtn_column(좁은 화면 표시)이 공존하고,
+  // 클래스 .btn_done은 패스키 로그인 버튼(#passkeyBtn_row/_column)도 함께 쓰므로 클래스로 잡으면
+  // 패스키를 눌러버린다. id 접두어로 한정한 뒤 실제로 보이는 것을 고른다.
+  // 클릭은 JS .click()이 아닌 Puppeteer 물리 클릭으로 — 네이버가 isTrusted를 볼 여지를 남기지 않는다.
+  const loginBtnId = await page.evaluate(() => {
+    const els = Array.from(document.querySelectorAll('button[id^="loginBtn"]')) as HTMLElement[];
+    const target = els.find((el) => el.getBoundingClientRect().height > 0) || els[0];
+    return target ? target.id : null;
+  });
+
+  if (loginBtnId) {
+    await page.click(`#${loginBtnId}`);
   } else {
-    await page.click('.btn_login');
+    // 레거시 마크업 폴백 (구 로그인 페이지가 남아있는 경우)
+    const legacyBtn = (await page.$('#log\\.login')) || (await page.$('.btn_login'));
+    if (!legacyBtn) {
+      throw new Error(
+        '로그인 버튼을 찾지 못했습니다 — 네이버 로그인 폼 마크업이 또 변경된 것으로 보입니다 ' +
+          '(기대: button[id^="loginBtn"] 또는 레거시 #log.login/.btn_login)'
+      );
+    }
+    await legacyBtn.click();
   }
 
   // 로그인 성공 후 페이지 렌더링을 기다립니다.
@@ -339,6 +358,114 @@ export async function loginToNaver(page: Page): Promise<boolean> {
 }
 
 /**
+ * 작업용 탭 하나만 남기고 전부 닫는다 (2026-07-30).
+ *
+ * userDataDir로 크롬 프로필을 영속화하는데(로그인 세션 유지 목적), 데몬이 비정상 종료되면
+ * (크래시 / taskkill / 래퍼의 강제 재시작) 크롬이 정상 종료 플래그를 남기지 못해 다음 실행에서
+ * 세션 복원이 이전 탭을 전부 되살린다. 여기에 newPage()가 매번 하나씩 더 얹혀 탭이 무한 누적된다.
+ * 쿠키는 탭과 무관하므로 이렇게 정리해도 로그인 세션은 유지된다.
+ */
+async function closeOtherTabs(browser: Browser, keep: Page) {
+  for (const p of await browser.pages()) {
+    if (p !== keep) await p.close().catch(() => {});
+  }
+}
+
+/**
+ * esbuild `keepNames` 헬퍼(`__name`) 폴리필 (2026-07-30).
+ *
+ * page.evaluate는 콜백을 문자열로 직렬화해 브라우저에서 실행한다. 그런데 tsx(esbuild)는
+ * 이름 붙은 함수를 `__name(fn, "이름")`으로 감싸고 `__name`은 Node 모듈 프렐류드에만 정의되므로,
+ * evaluate 안에 이름 붙은 함수가 있으면 브라우저에서 ReferenceError가 난다.
+ * 원본 fac는 SWC로 빌드돼 재현되지 않고 tsx로 도는 이 데몬에서만 터지므로 놓치기 쉽다.
+ *
+ * 인자를 문자열로 넘기는 것이 핵심 — 함수로 넘기면 이 shim 자체가 트랜스파일 대상이 된다.
+ */
+async function installNameShim(page: Page) {
+  await page
+    .evaluateOnNewDocument(
+      'if (typeof __name === "undefined") { window.__name = function (f) { return f; }; }'
+    )
+    .catch(() => {});
+}
+
+/**
+ * 재업 대상 게시판 결정 — 원본 글이 있던 게시판을 그대로 쓴다 (2026-07-30).
+ *
+ * 배경: 기존에는 '자유게시판'을 텍스트로 찾고, 실패하면 드롭다운 목록에서 필터를 통과한
+ * "첫 번째 항목"을 그냥 집는 자가치유 폴백이 돌았다. 게시판이 몇 개뿐인 테스트 카페에서는
+ * 우연히 맞았지만, 게시판이 많은 실카페(28310071)에서는 사실상 무작위라 상품 재업글이
+ * '🗂계좌정보>핫딜매니저' 게시판에 등록되는 사고가 났다.
+ *
+ * 재업은 원래 그 상품을 수집해온 게시판으로 되돌아가는 것이 맞다. 크롤러가 게시판을 별도
+ * 컬럼으로 저장하지 않으므로, products.naver_article_url(원본 글)을 열어 게시판명을 읽는다.
+ * 읽지 못하면 null을 반환하고, 호출부는 글을 쓰지 않고 실패시킨다.
+ */
+async function resolveTargetBoardName(page: Page, productId?: string): Promise<string | null> {
+  if (!productId) {
+    console.error('[Uploader] payload.productId가 없어 원본 게시판을 확인할 수 없습니다.');
+    return null;
+  }
+
+  const supaUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supaKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!supaUrl || !supaKey) {
+    console.error('[Uploader] Supabase 환경변수 누락 — 원본 게시판 확인 불가.');
+    return null;
+  }
+
+  const sb = createClient(supaUrl, supaKey, { auth: { persistSession: false } });
+  const { data, error } = await sb
+    .from('products')
+    .select('naver_article_url')
+    .eq('id', productId)
+    .maybeSingle();
+
+  const articleUrl = data?.naver_article_url as string | undefined;
+  if (error || !articleUrl) {
+    console.error(`[Uploader] 원본 글 URL 조회 실패: ${error?.message || '값 없음'}`);
+    return null;
+  }
+
+  // naver_article_url은 두 형식이 섞여 있다:
+  //   크롤러 적재분 → https://cafe.naver.com/f-e/cafes/{cafeId}/articles/{id}      (PC)
+  //   포스터 갱신분 → https://m.cafe.naver.com/ca-fe/web/cafes/{cafeId}/articles/{id}?tc (모바일)
+  // 게시판명을 읽는 .tit_menu는 모바일 페이지에만 있으므로 항상 모바일 형식으로 정규화한다.
+  const ids = articleUrl.match(/cafes\/(\d+)\/articles\/(\d+)/);
+  if (!ids) {
+    console.error(`[Uploader] 원본 글 URL에서 카페/글 ID를 파싱하지 못했습니다: ${articleUrl}`);
+    return null;
+  }
+  const mobileUrl = `https://m.cafe.naver.com/ca-fe/web/cafes/${ids[1]}/articles/${ids[2]}`;
+
+  console.log(`[Uploader] 원본 글에서 게시판 확인 중: ${mobileUrl}`);
+  try {
+    await page.goto(mobileUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+
+    const name = await page.evaluate(() => {
+      const el = document.querySelector('.tit_menu');
+      if (!el) return null;
+      // .tit_menu 텍스트는 "실시간>프랜치캣.게스.티파니.엘리콘앱 열기" 처럼 끝에 '앱 열기'가 붙는다.
+      // 게시판명 자체가 <a> 안에 들어있으므로 a/button을 지우면 이름까지 날아간다 — 꼬리만 떼어낸다.
+      const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      const cleaned = text.replace(/앱\s*열기\s*$/, '').trim();
+      return cleaned || null;
+    });
+
+    if (!name) {
+      console.error('[Uploader] 원본 글에서 게시판명을 찾지 못했습니다 (.tit_menu 매칭 실패).');
+      return null;
+    }
+    console.log(`[Uploader] 원본 게시판 확인: "${name}"`);
+    return name;
+  } catch (err: any) {
+    console.error(`[Uploader] 원본 글 열기 실패: ${err?.message || err}`);
+    return null;
+  }
+}
+
+/**
  * 세션 워밍업 (2026-07-30) — 포스터 데몬이 재업 작업 없이도 주기적으로 호출한다.
  *
  * 배경: 포스터는 작업이 있을 때만 브라우저를 띄우므로(크롤러는 10분마다 상시 접속) 세션이
@@ -353,12 +480,23 @@ export async function ensurePosterSession(): Promise<{ ok: boolean; diagnostics:
     headless: process.env.NAVER_HEADLESS === 'false' ? false : true,
     protocolTimeout: 120_000,
     userDataDir: process.env.NAVER_PROFILE_DIR || undefined,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,1024', '--disable-blink-features=AutomationControlled'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--window-size=1280,1024',
+      '--disable-blink-features=AutomationControlled',
+      // 프로필 영속화 + 비정상 종료 조합에서 뜨는 "복원하시겠습니까?" 버블이 클릭을 가로채는 것 방지
+      '--hide-crash-restore-bubble',
+      '--no-first-run',
+      '--no-default-browser-check',
+    ],
   });
 
   let page: Page | null = null;
   try {
     page = await browser.newPage();
+    await closeOtherTabs(browser, page);
+    await installNameShim(page);
     await page.setViewport({ width: 1280, height: 1024 });
     await page.setUserAgent(
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -446,12 +584,18 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
       '--disable-setuid-sandbox',
       '--window-size=1280,1024',
       '--disable-blink-features=AutomationControlled',
+      // 프로필 영속화 + 비정상 종료 조합에서 뜨는 "복원하시겠습니까?" 버블이 클릭을 가로채는 것 방지
+      '--hide-crash-restore-bubble',
+      '--no-first-run',
+      '--no-default-browser-check',
     ],
   });
 
   let page: Page | null = null;
   try {
     page = await browser.newPage();
+    await closeOtherTabs(browser, page);
+    await installNameShim(page);
     await page.setViewport({ width: 1280, height: 1024 });
     await page.setUserAgent(
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -485,9 +629,19 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
         : loginSignals.note === 'NO_CREDENTIALS' ? 'NO_CREDENTIALS'
         : 'LOGIN_FAILED';
       await recordDiagnostics(page, reason, '네이버 로그인에 실패했습니다. 창을 띄워(NAVER_HEADLESS=false) 수동 로그인이 필요합니다.', 'LOGIN');
-      await browser.close();
-      cleanLocalTempImages(localImagePaths);
-      return null;
+      return null; // 정리(이미지 삭제 + 브라우저 종료)는 finally에서 일괄 처리
+    }
+
+    // 2-1) 대상 게시판 확정 — 글쓰기 폼에 들어가기 전에 원본 글에서 읽어온다.
+    //      확정하지 못하면 여기서 중단한다. 엉뚱한 게시판에 상품글을 올리는 것보다
+    //      실패로 남겨 관리자가 확인하는 편이 낫다. (2026-07-30 오게시 사고 대응)
+    const targetBoardName = await resolveTargetBoardName(page, payload.productId);
+    if (!targetBoardName) {
+      throw new Error(
+        '원본 게시판을 확정하지 못해 등록을 중단했습니다. ' +
+          '(products.naver_article_url로 원본 글을 열어 게시판명을 읽지 못함) — ' +
+          '임의의 게시판에 올리지 않기 위한 의도적 중단입니다.'
+      );
     }
 
     // 3) 모바일 글쓰기 페이지로 이동 (iframe 우회를 위해 모바일 버전 글쓰기 폼 활용)
@@ -565,90 +719,77 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
 
-    // 2) 게시판 렌더링 및 자가치유 탐색(Self-Healing Selector) 수행
-    console.log('[Uploader] 자유게시판 또는 대안 게시판 탐색 중...');
-    
-    const boardClicked = await page.evaluate(() => {
-      const items = Array.from(document.querySelectorAll('*'));
-      
-      // 1순위: '자유게시판' 매칭
-      const targets = items.filter(el => {
-        const text = (el.textContent || '').trim();
+    // 2) 원본 게시판을 "정확 일치"로만 탐색한다.
+    //    부분일치나 "목록의 첫 항목" 폴백은 절대 쓰지 않는다 — 실카페에서 상품 재업글이
+    //    '🗂계좌정보>핫딜매니저' 게시판에 등록된 사고의 원인이 바로 그 자가치유 폴백이었다.
+    //    못 찾으면 글을 쓰지 않고 실패시킨다. (2026-07-30)
+    console.log(`[Uploader] 원본 게시판 "${targetBoardName}" 탐색 중...`);
+
+    const boardClicked = await page.evaluate((wanted) => {
+      const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
+      const want = norm(wanted);
+
+      // 텍스트가 "정확히" 일치하고 화면에 보이는 요소를 모은다.
+      // 말단 요소만 보면 안 된다 — 드롭다운 항목은 <li><span>게시판명</span></li> 처럼
+      // 자식을 가진 li로 렌더되기도 한다. 정확 일치를 요구하므로 상위 컨테이너 오탐은 생기지 않고,
+      // 그중 가장 깊은(자손이 가장 적은) 요소를 눌러 실제 클릭 타겟을 맞춘다.
+      const candidates = (Array.from(document.querySelectorAll('*')) as HTMLElement[]).filter((el) => {
         const style = window.getComputedStyle(el);
-        return text === '자유게시판' && style.display !== 'none' && style.visibility !== 'hidden';
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        return norm(el.textContent || '') === want;
       });
 
-      let bestTarget = targets.find(el => el.children.length === 0) || targets[0];
-      let fallbackUsed = false;
-      let selectedName = '자유게시판';
+      candidates.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
+      const el = candidates[0];
+      if (!el) return { success: false, name: '', x: 0, y: 0 };
 
-      // 2순위 (자가치유): '자유게시판'이 없거나 비활성화된 경우, 드롭다운 목록에서 대안 게시판 탐색
-      if (!bestTarget) {
-        console.warn('[Uploader DOM] 자유게시판 텍스트 매칭 실패. 자가치유(Self-Healing) 대안 게시판 매칭 개시...');
-        
-        // 드롭다운 내부 또는 레이어 안의 모든 리스트 아이템 탐색
-        const listItems = Array.from(document.querySelectorAll('.select_board li, .LayerPopup li, .BasicLayer li, .list_board li, li[class*="item"]'));
-        
-        for (const li of listItems) {
-          const text = (li.textContent || '').trim();
-          const style = window.getComputedStyle(li);
-          
-          // 쓸데없는 헤더, 가입인사, 등급별 글쓰기 불가능한 항목 필터링
-          if (
-            style.display !== 'none' && 
-            style.visibility !== 'hidden' &&
-            text.length > 0 &&
-            !text.includes('게시판 선택') &&
-            !text.includes('전체글보기') &&
-            !text.includes('가입') &&
-            !text.includes('공지') &&
-            !text.includes('스탭') &&
-            !text.includes('주문')
-          ) {
-            // 이 li 내부에 클릭 가능한 말단 span 또는 a가 있으면 그것을 선택, 없으면 li 자체
-            bestTarget = li.querySelector('span, a, label') || li;
-            fallbackUsed = true;
-            selectedName = text;
-            break;
-          }
-        }
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = el.getBoundingClientRect();
+
+      el.click();
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+
+      const parentLi = el.closest('li');
+      if (parentLi) {
+        parentLi.click();
+        parentLi.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
       }
 
-      if (bestTarget) {
-        const el = bestTarget as HTMLElement;
-        el.scrollIntoView({ block: 'center', inline: 'center' });
-        const r = el.getBoundingClientRect();
-        
-        // 브라우저 클릭 이벤트 강제 유입
-        el.click();
-        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-        
-        const parentLi = el.closest('li');
-        if (parentLi) {
-          parentLi.click();
-          parentLi.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-        }
-        
-        return {
-          success: true,
-          fallbackUsed,
-          name: selectedName,
-          x: r.left + r.width / 2,
-          y: r.top + r.height / 2
-        };
-      }
-      return { success: false, fallbackUsed: false, name: '', x: 0, y: 0 };
-    });
+      return {
+        success: true,
+        name: norm(el.textContent || ''),
+        x: r.left + r.width / 2,
+        y: r.top + r.height / 2
+      };
+    }, targetBoardName);
 
-    if (boardClicked.success && boardClicked.x > 0 && boardClicked.y > 0) {
-      console.log(`[Uploader] 게시판 '${boardClicked.name}' 물리 좌표 터치 시도 (자가치유 적용: ${boardClicked.fallbackUsed}): x=${boardClicked.x}, y=${boardClicked.y}`);
+    if (!boardClicked.success) {
+      throw new Error(
+        `대상 게시판을 찾지 못했습니다: "${targetBoardName}" — 임의의 게시판에 올리지 않기 위해 등록을 중단합니다. ` +
+          '(원본 글의 게시판이 이 카페에 없거나 이름이 바뀐 경우)'
+      );
+    }
+
+    if (boardClicked.x > 0 && boardClicked.y > 0) {
+      console.log(`[Uploader] 게시판 '${boardClicked.name}' 물리 좌표 터치: x=${boardClicked.x}, y=${boardClicked.y}`);
       await page.mouse.click(boardClicked.x, boardClicked.y).catch(() => {});
       await new Promise((resolve) => setTimeout(resolve, 2000));
-    } else {
-      console.error('[Uploader] 자유게시판 및 자가치유 폴백 게시판 매칭 전면 실패. 등록 프로세스가 중단될 수 있습니다.');
     }
-    
-    console.log(`[Uploader] 게시판 자동 선택 완료 (선택 게시판: ${boardClicked.name || '미선택'})`);
+
+    // 3) 선택 결과 검증 — 클릭이 먹지 않아 다른 게시판인 채로 등록되는 것을 막는다
+    const selectedLabel = await page.evaluate((sel) => {
+      const box = document.querySelector(sel);
+      return box ? (box.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    }, selectBoxSelector);
+
+    if (!selectedLabel.includes(targetBoardName)) {
+      throw new Error(
+        `게시판 선택이 반영되지 않았습니다. 기대: "${targetBoardName}", 현재 선택박스: "${selectedLabel.slice(0, 120)}" — ` +
+          '잘못된 게시판에 등록되는 것을 막기 위해 중단합니다.'
+      );
+    }
+
+    console.log(`[Uploader] 게시판 자동 선택 완료 (선택 게시판: ${boardClicked.name})`);
     await new Promise((resolve) => setTimeout(resolve, 2000));
 
     // 모바일 글쓰기 제목 셀렉터 찾기 (Vue 컴포넌트인 textarea[placeholder="제목"] 우선 적용)
@@ -793,40 +934,42 @@ ${payload.content}
 
     // 🚨 [하이브리드 직접 주입 패턴] 본문 숫자 및 텍스트 씹힘 방지 보완 기동
     console.log('[Uploader] 본문 씹힘 방지를 위한 하이브리드 HTML/Text 직접 주입 시작...');
-    const injectSuccess = await page.evaluate((sel, contentStr) => {
+    // 1) 텍스트를 스마트에디터 표준 문단 형식(p > span)의 HTML로 변환
+    //    변환은 반드시 Node 쪽에서 끝낸다 — page.evaluate 안에 이름 붙은 함수(escapeHtml)를 두면
+    //    tsx(esbuild keepNames)가 __name(...)으로 감싸는데, evaluate 콜백은 문자열로 직렬화돼
+    //    브라우저에서 실행되므로 __name이 없어 "__name is not defined"로 본문 단계가 통째로
+    //    실패한다. 원본 fac는 SWC라 재현되지 않아 놓치기 쉽다. (2026-07-30 장애)
+    const escapeHtml = (text: string) =>
+      text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+
+    const PARA_OPEN = '<p class="se-text-paragraph se-text-paragraph-align-left">';
+    const htmlContent = formattedContent
+      .split('\n')
+      .map((line) =>
+        line.trim() === ''
+          ? `${PARA_OPEN}<span><br></span></p>`
+          : `${PARA_OPEN}<span>${escapeHtml(line)}</span></p>`
+      )
+      .join('');
+
+    // 2) 완성된 HTML 문자열만 브라우저로 넘겨 주입 + 에디터 리액티브 바인딩용 이벤트 디스패치
+    const injectSuccess = await page.evaluate((sel, html) => {
       const contentEl = document.querySelector(sel) as HTMLElement;
       if (!contentEl) return false;
 
-      // 1) 텍스트를 스마트에디터 표준 문단 형식(p > span)의 HTML로 변환
-      const escapeHtml = (text: string) => {
-        return text
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;')
-          .replace(/"/g, '&quot;')
-          .replace(/'/g, '&#039;');
-      };
+      contentEl.innerHTML = html;
 
-      const lines = contentStr.split('\n');
-      const htmlContent = lines.map(line => {
-        const trimmed = line.trim();
-        if (trimmed === '') {
-          return '<p class="se-text-paragraph se-text-paragraph-align-left"><span><br></span></p>';
-        }
-        return `<p class="se-text-paragraph se-text-paragraph-align-left"><span>${escapeHtml(line)}</span></p>`;
-      }).join('');
-
-      // 2) innerHTML 강제 주입
-      contentEl.innerHTML = htmlContent;
-
-      // 3) 에디터 리액티브 바인딩을 위한 DOM 이벤트 강제 디스패치
-      const events = ['input', 'change', 'keyup', 'keypress', 'keydown', 'blur'];
-      events.forEach(evtType => {
+      ['input', 'change', 'keyup', 'keypress', 'keydown', 'blur'].forEach((evtType) => {
         contentEl.dispatchEvent(new Event(evtType, { bubbles: true, cancelable: true }));
       });
 
       return true;
-    }, contentSelector, formattedContent);
+    }, contentSelector, htmlContent);
 
     if (injectSuccess) {
       console.log('[Uploader] HTML 직접 주입 대기 중...');
@@ -936,9 +1079,7 @@ ${payload.content}
     }
 
     console.log(`[Uploader] 자동 포스팅이 성공적으로 완료되었습니다! 등록 URL: ${finalUrl}`);
-    
-    cleanLocalTempImages(localImagePaths);
-    await browser.close();
+
     return finalUrl;
   } catch (err: any) {
     console.error('[Uploader] 자동 업로드 프로세스 도중 심각한 에러 발생:', err);
@@ -952,8 +1093,12 @@ ${payload.content}
       : 'EXCEPTION';
     await recordDiagnostics(page, reason, msg);
 
+    return null;
+  } finally {
+    // 성공/실패/조기반환/catch 내부 예외까지 모든 경로에서 정리를 보장한다.
+    // 브라우저를 정상 종료해야 크롬이 "비정상 종료" 플래그를 남기지 않고, 다음 실행에서
+    // 세션 복원으로 탭이 되살아나는 누적을 막는다. (ensurePosterSession과 동일한 패턴)
     cleanLocalTempImages(localImagePaths);
     await browser.close().catch(() => {});
-    return null;
   }
 }

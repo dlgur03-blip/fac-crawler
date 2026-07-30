@@ -22,6 +22,7 @@ import { createClient } from '@supabase/supabase-js';
 import type { Browser, Page } from 'puppeteer';
 import type { CafeListItem } from '../src/lib/naver/crawler';
 import { reportDaemonStatus } from '../src/lib/naver/daemon-status';
+import { isNonProductNotice } from '../src/lib/naver/notice-filter';
 
 // ---- .env.local 로드 (dotenv 없이 간단 파싱) ----
 (function loadEnv() {
@@ -517,6 +518,15 @@ async function runCrawl(page: Page, jobId: string, limit = 200, stopAfterDupes =
       const authorNickname = detail.authorNickname ? detail.authorNickname.trim() : null;
       const managerId = authorNickname ? managerMap.get(authorNickname) || null : null;
       const titleSoldout = detectSoldoutFromTitle(detail.title); // 제목 품절 표기 → 자동 품절
+
+      // 발송 안내 등 비상품 글 차단 (2026-07-31) — 본문에 금액이 있어 가격 파싱은 통과하므로
+      // 제목으로 걸러야 한다. 영구 스킵 캐시에 넣어 다음 사이클부터 본문 진입도 하지 않는다.
+      if (isNonProductNotice(detail.title)) {
+        await markIgnored(t.articleId, 'notice', detail.title);
+        console.log(`[CrawlDaemon] 🚫 #${t.articleId} 비상품 안내글 → 스킵: "${detail.title.slice(0, 30)}"`);
+        skipped++;
+        continue;
+      }
 
       // 최종 블록 가드 — 링크 경로에서 닉네임이 뒤늦게 채워진 경우 대비
       if (authorNickname && blockedAuthors.has(authorNickname)) {

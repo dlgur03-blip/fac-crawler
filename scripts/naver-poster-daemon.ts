@@ -119,11 +119,44 @@ class PostFailure extends Error {
   }
 }
 
+/**
+ * "실패"가 아니라 "제외"로 봐야 하는 작업인지 판정한다 (2026-08-01).
+ * 제외 사유가 있으면 사람이 읽을 문구를, 정상 처리 대상이면 null을 반환한다.
+ *
+ * 기준은 "대상 상품이 존재하지 않아 애초에 수행 불가"다. 재업 자체가 실패한 것과 구분해야
+ * 관리자가 실제로 손봐야 할 건수를 알 수 있다.
+ */
+async function classifyExcluded(p: any): Promise<string | null> {
+  if (!p?.productId) return '대상 상품이 지정되지 않은 작업입니다 (설치 확인용 테스트 글 등)';
+
+  const { data, error } = await sb.from('products').select('id').eq('id', p.productId).maybeSingle();
+  // 조회 자체가 실패하면 제외로 단정하지 않는다 — 일시 오류로 작업을 버리면 안 된다
+  if (error) return null;
+  if (!data) return '대상 상품이 삭제되어 재업할 수 없습니다';
+  return null;
+}
+
 async function processJob(job: any) {
   const { uploadToNaverCafe, getLastUploadDiagnostics, describeDiagnostics, getLastPostedBoardName } =
     await import('../src/lib/naver/uploader');
   const p = job.payload;
   const kind = p.type === 'REPOST' ? '재업(끌올)' : '신규 포스팅';
+
+  // 대상 상품이 아예 없는 작업은 "실패"가 아니라 "제외"다 — 재시도해도 달라질 게 없으므로
+  // 브라우저를 띄우지 않고 즉시 종료한다. 관리자 화면도 이 플래그로 실패와 구분해 표기한다.
+  // (설치 확인용 [테스트] 글처럼 productId가 없는 작업, 상품이 이미 삭제된 작업) 2026-08-01
+  const excluded = await classifyExcluded(p);
+  if (excluded) {
+    await sb.from('posting_queue').update({
+      status: 'FAILED',
+      error: excluded,
+      result: { excluded: true, reason: excluded },
+      updated_at: new Date().toISOString()
+    }).eq('id', job.id);
+    console.log(`[Daemon] ⏭️ 제외: "${p.title}" — ${excluded}`);
+    return;
+  }
+
   console.log(`[Daemon] ▶ ${kind}: "${p.title}" (job ${job.id}, 시도 ${job.attempts})`);
   // 처리 중에도 생존 신호를 남겨 실제 hang과 긴 이미지 업로드를 구분한다.
   const heartbeat = setInterval(() => {

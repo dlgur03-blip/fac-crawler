@@ -134,18 +134,27 @@ async function processJob(job: any) {
   const result = await uploadToNaverCafe(p).finally(() => clearInterval(heartbeat));
   if (result && result !== 'DELEGATED_TO_DAEMON') {
     await sb.from('posting_queue').update({ status: 'DONE', result_url: result, error: null, updated_at: new Date().toISOString() }).eq('id', job.id);
-    if (p.productId) {
+    // 테스트 카페 포스팅은 products를 건드리지 않는다 (2026-08-01).
+    // 기존에는 cafe_article_id만 실카페 가드가 있고 naver_article_url·posted_at은 무조건
+    // 덮어썼다. 그 결과 테스트 카페로 검증 한 번 돌리면 실제 상품의 원본 글 링크가
+    // 테스트 카페 글로 바뀌어, 이후 재업이 "원본 게시판=자유게시판"을 읽고 실카페에서
+    // 그 게시판을 못 찾아 실패했다(실측 2건). 테스트 결과는 DB에 남기지 않는 것이 맞다.
+    const isRealCafe = POST_CAFE_ID === CRAWL_CLUB_ID;
+    if (p.productId && isRealCafe) {
       const upd: Record<string, unknown> = {
         naver_article_url: result,
         posted_at: new Date().toISOString(), // 재업/신규 모두 카페 게시 시각 갱신 (어드민 📢 날짜)
       };
-      // 실카페 포스팅일 때만 새 글ID 기록 → 다음 크롤 사이클이 existingIds로 본문 진입 자체를 스킵 (dedup 1차 방어)
-      if (POST_CAFE_ID === CRAWL_CLUB_ID) {
-        const articleId = result.match(/articles\/(\d+)/)?.[1] || result.match(/\/(\d+)(?:[/?#]|$)/)?.[1];
-        if (articleId) upd.cafe_article_id = Number(articleId);
-      }
+      // 새 글ID 기록 → 다음 크롤 사이클이 existingIds로 본문 진입 자체를 스킵 (dedup 1차 방어)
+      const articleId = result.match(/articles\/(\d+)/)?.[1] || result.match(/\/(\d+)(?:[/?#]|$)/)?.[1];
+      if (articleId) upd.cafe_article_id = Number(articleId);
+
       const { error: prodErr } = await sb.from('products').update(upd).eq('id', p.productId);
       if (prodErr) console.warn(`[Daemon] ⚠️ 상품 갱신 실패 (product ${p.productId}): ${prodErr.message}`);
+    } else if (p.productId) {
+      console.log(
+        `[Daemon] 🧪 테스트 카페(${POST_CAFE_ID}) 게시 — products 갱신 생략 (실카페는 ${CRAWL_CLUB_ID})`
+      );
     }
     console.log(`[Daemon] ✅ 완료 → ${result}`);
     loginRequired = false;

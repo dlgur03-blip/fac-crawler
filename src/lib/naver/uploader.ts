@@ -80,6 +80,16 @@ export function getLastUploadDiagnostics(): UploadDiagnostics | null {
   return lastDiagnostics;
 }
 
+/**
+ * 직전 재업이 실제로 글을 올린 게시판명 (성공했을 때만 값이 있다).
+ * 호출부(포스터 데몬)가 products.cafe_board_name 에 기록해, 다음 재업이 카페 글을
+ * 열지 않고도 게시판을 알 수 있게 한다. 추론이 아니라 방금 올린 곳이므로 확정값이다.
+ */
+let lastPostedBoardName: string | null = null;
+export function getLastPostedBoardName(): string | null {
+  return lastPostedBoardName;
+}
+
 /** 로그인 페이지의 캡차·기기확인 흔적을 실제로 검사한다 (기존에는 감지 코드가 전무했음) */
 async function inspectLoginBlockers(page: Page): Promise<{ captcha: boolean; deviceConfirm: boolean; url: string; title: string }> {
   let url = '';
@@ -416,15 +426,41 @@ async function resolveTargetBoardName(page: Page, productId?: string): Promise<B
   }
 
   const sb = createClient(supaUrl, supaKey, { auth: { persistSession: false } });
-  const { data, error } = await sb
+
+  // 1순위: DB에 저장된 게시판. 재업 성공 시 포스터가 기록한 확정값이라 카페 글 상태와 무관하다.
+  //   cafe_board_name 컬럼이 아직 없는 환경(마이그레이션 미적용)에서는 select 자체가 실패하므로
+  //   컬럼 없이 한 번 더 조회해 기존 동작으로 폴백한다. 적용 순서에 상관없이 돌아가게 하기 위함.
+  type ProductBoardRow = { naver_article_url?: string | null; cafe_board_name?: string | null };
+  let data: ProductBoardRow | null = null;
+
+  const withBoard = await sb
     .from('products')
-    .select('naver_article_url')
+    .select('naver_article_url, cafe_board_name')
     .eq('id', productId)
     .maybeSingle();
 
-  const articleUrl = data?.naver_article_url as string | undefined;
-  if (error || !articleUrl) {
-    return { name: null, detail: `원본 글 URL 조회 실패: ${error?.message || 'naver_article_url 값이 비어 있음'}` };
+  if (withBoard.error) {
+    const fallback = await sb.from('products').select('naver_article_url').eq('id', productId).maybeSingle();
+    if (fallback.error) {
+      return { name: null, detail: `원본 글 URL 조회 실패: ${fallback.error.message}` };
+    }
+    data = fallback.data as ProductBoardRow | null;
+  } else {
+    data = withBoard.data as ProductBoardRow | null;
+  }
+
+  const stored = (data?.cafe_board_name || '').trim();
+  if (stored) {
+    console.log(`[Uploader] 저장된 게시판 사용: "${stored}" (카페 글 조회 생략)`);
+    return { name: stored };
+  }
+
+  const articleUrl = (data?.naver_article_url || '') as string;
+  if (!articleUrl) {
+    return {
+      name: null,
+      detail: 'products.cafe_board_name 도 naver_article_url 도 없어 게시판을 확정할 수 없습니다'
+    };
   }
 
   // naver_article_url은 두 형식이 섞여 있다:
@@ -577,6 +613,7 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
 
   // 이번 시도의 진단 슬롯 초기화 (데몬이 실패 후 getLastUploadDiagnostics()로 읽는다)
   lastDiagnostics = null;
+  lastPostedBoardName = null;
   setStage('LOGIN');
 
   // 1) 로컬에 이미지 다운로드
@@ -1092,6 +1129,8 @@ ${payload.content}
 
     console.log(`[Uploader] 자동 포스팅이 성공적으로 완료되었습니다! 등록 URL: ${finalUrl}`);
 
+    // 방금 올린 게시판을 호출부가 DB에 기록할 수 있게 남긴다 (다음 재업은 카페 글 조회 불필요)
+    lastPostedBoardName = targetBoardName;
     return finalUrl;
   } catch (err: any) {
     console.error('[Uploader] 자동 업로드 프로세스 도중 심각한 에러 발생:', err);

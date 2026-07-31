@@ -120,7 +120,8 @@ class PostFailure extends Error {
 }
 
 async function processJob(job: any) {
-  const { uploadToNaverCafe, getLastUploadDiagnostics, describeDiagnostics } = await import('../src/lib/naver/uploader');
+  const { uploadToNaverCafe, getLastUploadDiagnostics, describeDiagnostics, getLastPostedBoardName } =
+    await import('../src/lib/naver/uploader');
   const p = job.payload;
   const kind = p.type === 'REPOST' ? '재업(끌올)' : '신규 포스팅';
   console.log(`[Daemon] ▶ ${kind}: "${p.title}" (job ${job.id}, 시도 ${job.attempts})`);
@@ -149,7 +150,20 @@ async function processJob(job: any) {
       const articleId = result.match(/articles\/(\d+)/)?.[1] || result.match(/\/(\d+)(?:[/?#]|$)/)?.[1];
       if (articleId) upd.cafe_article_id = Number(articleId);
 
-      const { error: prodErr } = await sb.from('products').update(upd).eq('id', p.productId);
+      // 방금 올린 게시판을 기록 → 다음 재업은 카페 글을 열지 않아도 된다.
+      // (원본 글이 삭제되면 게시판을 못 읽어 재업이 막히던 문제의 근본 해결)
+      const boardName = getLastPostedBoardName();
+      if (boardName) upd.cafe_board_name = boardName;
+
+      let { error: prodErr } = await sb.from('products').update(upd).eq('id', p.productId);
+
+      // cafe_board_name 컬럼이 아직 없는 환경(마이그레이션 미적용)이면 그 필드만 빼고 재시도한다.
+      // 게시판 기록 실패가 재업 자체를 실패로 만들면 안 된다.
+      if (prodErr && boardName && /cafe_board_name/.test(prodErr.message)) {
+        console.warn('[Daemon] ⚠️ cafe_board_name 컬럼이 없어 게시판 기록을 생략합니다 (마이그레이션 필요)');
+        delete upd.cafe_board_name;
+        ({ error: prodErr } = await sb.from('products').update(upd).eq('id', p.productId));
+      }
       if (prodErr) console.warn(`[Daemon] ⚠️ 상품 갱신 실패 (product ${p.productId}): ${prodErr.message}`);
     } else if (p.productId) {
       console.log(

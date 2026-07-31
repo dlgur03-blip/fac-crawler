@@ -389,6 +389,9 @@ async function installNameShim(page: Page) {
     .catch(() => {});
 }
 
+/** 게시판 확정 결과 — 실패 시 사람이 읽고 바로 조치할 수 있는 detail을 담는다 */
+type BoardResolution = { name: string } | { name: null; detail: string };
+
 /**
  * 재업 대상 게시판 결정 — 원본 글이 있던 게시판을 그대로 쓴다 (2026-07-30).
  *
@@ -401,17 +404,15 @@ async function installNameShim(page: Page) {
  * 컬럼으로 저장하지 않으므로, products.naver_article_url(원본 글)을 열어 게시판명을 읽는다.
  * 읽지 못하면 null을 반환하고, 호출부는 글을 쓰지 않고 실패시킨다.
  */
-async function resolveTargetBoardName(page: Page, productId?: string): Promise<string | null> {
+async function resolveTargetBoardName(page: Page, productId?: string): Promise<BoardResolution> {
   if (!productId) {
-    console.error('[Uploader] payload.productId가 없어 원본 게시판을 확인할 수 없습니다.');
-    return null;
+    return { name: null, detail: 'payload에 productId가 없어 원본 글을 특정할 수 없습니다' };
   }
 
   const supaUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supaKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!supaUrl || !supaKey) {
-    console.error('[Uploader] Supabase 환경변수 누락 — 원본 게시판 확인 불가.');
-    return null;
+    return { name: null, detail: 'Supabase 환경변수 누락으로 원본 글 URL을 조회할 수 없습니다' };
   }
 
   const sb = createClient(supaUrl, supaKey, { auth: { persistSession: false } });
@@ -423,8 +424,7 @@ async function resolveTargetBoardName(page: Page, productId?: string): Promise<s
 
   const articleUrl = data?.naver_article_url as string | undefined;
   if (error || !articleUrl) {
-    console.error(`[Uploader] 원본 글 URL 조회 실패: ${error?.message || '값 없음'}`);
-    return null;
+    return { name: null, detail: `원본 글 URL 조회 실패: ${error?.message || 'naver_article_url 값이 비어 있음'}` };
   }
 
   // naver_article_url은 두 형식이 섞여 있다:
@@ -433,15 +433,27 @@ async function resolveTargetBoardName(page: Page, productId?: string): Promise<s
   // 게시판명을 읽는 .tit_menu는 모바일 페이지에만 있으므로 항상 모바일 형식으로 정규화한다.
   const ids = articleUrl.match(/cafes\/(\d+)\/articles\/(\d+)/);
   if (!ids) {
-    console.error(`[Uploader] 원본 글 URL에서 카페/글 ID를 파싱하지 못했습니다: ${articleUrl}`);
-    return null;
+    return { name: null, detail: `원본 글 URL 형식을 해석하지 못했습니다: ${articleUrl}` };
   }
-  const mobileUrl = `https://m.cafe.naver.com/ca-fe/web/cafes/${ids[1]}/articles/${ids[2]}`;
+  const [, cafeId, articleId] = ids;
+  const mobileUrl = `https://m.cafe.naver.com/ca-fe/web/cafes/${cafeId}/articles/${articleId}`;
 
   console.log(`[Uploader] 원본 글에서 게시판 확인 중: ${mobileUrl}`);
   try {
     await page.goto(mobileUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     await new Promise((resolve) => setTimeout(resolve, 2500));
+
+    // 원본이 삭제됐으면 "삭제되었거나 존재하지 않는 게시글입니다" 알림 뒤 카페 홈으로 튕긴다.
+    // 이 경우를 따로 구분해줘야 관리자가 원인을 바로 안다 (예전엔 '로그인 필요'로 잘못 보였다). 2026-08-01
+    const landedUrl = page.url();
+    if (!landedUrl.includes(`/articles/${articleId}`)) {
+      return {
+        name: null,
+        detail:
+          `원본 글(${articleId})이 삭제되었거나 접근할 수 없습니다 — 카페에서 이미 지워진 글로 보입니다. ` +
+          '원본이 없으면 어느 게시판에 올릴지 알 수 없어 재업할 수 없습니다.'
+      };
+    }
 
     const name = await page.evaluate(() => {
       const el = document.querySelector('.tit_menu');
@@ -454,14 +466,12 @@ async function resolveTargetBoardName(page: Page, productId?: string): Promise<s
     });
 
     if (!name) {
-      console.error('[Uploader] 원본 글에서 게시판명을 찾지 못했습니다 (.tit_menu 매칭 실패).');
-      return null;
+      return { name: null, detail: `원본 글(${articleId}) 페이지에서 게시판명(.tit_menu)을 읽지 못했습니다` };
     }
     console.log(`[Uploader] 원본 게시판 확인: "${name}"`);
-    return name;
+    return { name };
   } catch (err: any) {
-    console.error(`[Uploader] 원본 글 열기 실패: ${err?.message || err}`);
-    return null;
+    return { name: null, detail: `원본 글 열기 실패: ${err?.message || err}` };
   }
 }
 
@@ -635,14 +645,16 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
     // 2-1) 대상 게시판 확정 — 글쓰기 폼에 들어가기 전에 원본 글에서 읽어온다.
     //      확정하지 못하면 여기서 중단한다. 엉뚱한 게시판에 상품글을 올리는 것보다
     //      실패로 남겨 관리자가 확인하는 편이 낫다. (2026-07-30 오게시 사고 대응)
-    const targetBoardName = await resolveTargetBoardName(page, payload.productId);
-    if (!targetBoardName) {
-      throw new Error(
-        '원본 게시판을 확정하지 못해 등록을 중단했습니다. ' +
-          '(products.naver_article_url로 원본 글을 열어 게시판명을 읽지 못함) — ' +
-          '임의의 게시판에 올리지 않기 위한 의도적 중단입니다.'
-      );
+    //      stage를 먼저 CAFE_ENTER로 올리는 것이 중요하다. LOGIN인 채로 예외가 나면
+    //      isLoginBlocked()가 stage === 'LOGIN'만 보고 "로그인 차단"으로 오분류해서,
+    //      로그인이 멀쩡한데도 관리자 화면에 '포스터 로그인 필요'가 뜨고 재시도도 막힌다.
+    //      (2026-08-01 오탐 사고 — 원본 글 삭제 3건이 로그인 장애로 보고됐다)
+    setStage('CAFE_ENTER');
+    const resolved = await resolveTargetBoardName(page, payload.productId);
+    if (resolved.name === null) {
+      throw new Error(`원본 게시판을 확정하지 못해 등록을 중단했습니다 — ${resolved.detail}`);
     }
+    const targetBoardName = resolved.name;
 
     // 3) 모바일 글쓰기 페이지로 이동 (iframe 우회를 위해 모바일 버전 글쓰기 폼 활용)
     setStage('CAFE_ENTER');

@@ -12,3 +12,6 @@ temp_uploads/
 
 # 진단용 실패 스크린샷 (네이버 화면이 찍힐 수 있어 공개 레포에 올리지 않는다)
 error_screenshot.png
+
+# 계정 전환 시 남긴 이전 설정 백업 (비밀번호 포함 — 절대 커밋 금지)
+.env.local.bak*

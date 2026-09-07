@@ -28,3 +28,21 @@ export function isNonProductNotice(title: string): boolean {
   if (!t) return false;
   return SHIPPING_NOTICE.test(t) || OPERATION_NOTICE.test(t);
 }
+
+/**
+ * 우리가 수집하면 안 되는 게시판인지 판정한다. (2026-09-07)
+ *
+ * 카페 전체글 목록은 판매자 공구글과 **회원끼리 중고 거래하는 벼룩 게시판**을 섞어 보여준다.
+ * 실측(#425766·#425810·#425816 등 11건): 전부 `회원간 벼룩 재판매>성인기타&잡화` 이고
+ * 작성자도 나의루루·해피해피·챠밍 같은 일반 회원이었다. 이런 글이 몰 상품으로 올라가면
+ * 회원 개인 물건을 우리가 파는 셈이 된다.
+ *
+ * 지금까지는 회원들이 가격을 우리 형식(`50000 3000`)으로 안 적어서 우연히 안 들어왔을 뿐이고
+ * (실측: 벼룩 출신 상품 0건), 형식만 맞으면 그대로 유입된다. 작성자 차단은 회원이 계속
+ * 늘어나 감당이 안 되므로 게시판 이름으로 막는다.
+ */
+export function isMemberOnlyBoard(boardName: string | null | undefined): boolean {
+  if (!boardName) return false; // 못 읽었으면 기존대로 진행 — 판정 실패로 정상 상품을 막지 않는다
+  const b = String(boardName).replace(/&gt;/g, '>').replace(/\s+/g, '');
+  return /벼룩|회원간|중고장터|회원장터/.test(b);
+}

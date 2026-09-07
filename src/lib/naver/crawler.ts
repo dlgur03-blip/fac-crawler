@@ -309,6 +309,11 @@ export interface CafeListItem {
   title: string;
   author: string;
   isNotice: boolean;
+  /**
+   * 전체글 목록 행에 붙어 있는 게시판(메뉴) 이름. 회원 벼룩 게시판을 걸러내는 데 쓴다.
+   * 공지 행처럼 메뉴 링크가 없는 경우가 있어 null 이 될 수 있다 — 그때는 기존대로 진행한다.
+   */
+  boardName: string | null;
 }
 
 export interface CafeArticleDetail {
@@ -704,7 +709,7 @@ export async function scrapeCafeList(
   const MAX_PAGES = 30; // 무한 루프 안전 가드
   const collected = new Map<
     number,
-    { articleId: number; title: string; author: string; isNotice: boolean; firstPage: number }
+    { articleId: number; title: string; author: string; isNotice: boolean; boardName: string | null; firstPage: number }
   >();
   const pinnedIds = new Set<number>(); // 여러 페이지에 반복 노출되는 고정 공지
 
@@ -720,9 +725,9 @@ export async function scrapeCafeList(
     await sleepMs(2500);
     await injectEsbuildNameShim(page);
 
-    const items: Array<{ articleId: number; title: string; author: string; isNotice: boolean }> =
+    const items: Array<{ articleId: number; title: string; author: string; isNotice: boolean; boardName: string | null }> =
       await page.evaluate(() => {
-        const out: Array<{ articleId: number; title: string; author: string; isNotice: boolean }> = [];
+        const out: Array<{ articleId: number; title: string; author: string; isNotice: boolean; boardName: string | null }> = [];
         const seen = new Set<number>();
 
         // ── 1) 행 후보 셀렉터 폴백 체인 (구조 변경 대비 자가치유) ──
@@ -765,6 +770,15 @@ export async function scrapeCafeList(
             if (!title || /^\[?\d+\]?$/.test(title)) return;
           }
 
+          // 게시판(메뉴) 이름 — 행 안의 메뉴 링크에서 읽는다.
+          // 전체글 목록은 모든 게시판을 섞어 보여주므로, 회원 벼룩글을 여기서 걸러내려면 이 값이 필요하다.
+          let boardName: string | null = null;
+          if (row) {
+            const menuEl = row.querySelector('a[href*="/menus/"]');
+            const t = menuEl ? (menuEl.textContent || '').replace(/\s+/g, ' ').trim() : '';
+            if (t) boardName = t;
+          }
+
           // 작성자 — 폴백 체인
           let author = '';
           if (row) {
@@ -793,7 +807,7 @@ export async function scrapeCafeList(
           }
 
           seen.add(articleId);
-          out.push({ articleId, title, author, isNotice });
+          out.push({ articleId, title, author, isNotice, boardName });
         };
 
         if (rows.length > 0) {
@@ -851,6 +865,7 @@ export async function scrapeCafeList(
       title: v.title,
       author: v.author,
       isNotice: v.isNotice || pinnedIds.has(v.articleId) || NOTICE_TITLE_RE.test(v.title),
+      boardName: v.boardName,
     }))
     .sort((a, b) => b.articleId - a.articleId); // 최신순
 

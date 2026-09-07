@@ -22,7 +22,7 @@ import { createClient } from '@supabase/supabase-js';
 import type { Browser, Page } from 'puppeteer';
 import type { CafeListItem } from '../src/lib/naver/crawler';
 import { reportDaemonStatus } from '../src/lib/naver/daemon-status';
-import { isNonProductNotice } from '../src/lib/naver/notice-filter';
+import { isNonProductNotice, isMemberOnlyBoard } from '../src/lib/naver/notice-filter';
 
 // ---- .env.local 로드 (dotenv 없이 간단 파싱) ----
 (function loadEnv() {
@@ -337,11 +337,16 @@ async function runCrawl(page: Page, jobId: string, limit = 200, stopAfterDupes =
   const targets = candidates
     .filter((c) => !existingIds.has(c.articleId) && !ignoredIds.has(c.articleId))
     .filter((c) => !blockedAuthors.has((c.author || '').trim()))
+    // 회원 벼룩 게시판 글은 본문조차 열지 않는다 — 회원 개인 물건이 몰 상품이 되면 안 된다 (2026-09-07)
+    .filter((c) => !isMemberOnlyBoard(c.boardName))
     .sort((a, b) => a.articleId - b.articleId);
 
   const ignoredHit = candidates.filter((c) => !existingIds.has(c.articleId) && ignoredIds.has(c.articleId)).length;
   const blockedHit = candidates.filter((c) => blockedAuthors.has((c.author || '').trim())).length;
-  console.log(`[CrawlDaemon] 목록 ${scanned}건 중 신규 후보 ${targets.length}건 본문 수집 시작... (비상품 캐시 스킵 ${ignoredHit}건, 블록 작성자 스킵 ${blockedHit}건)`);
+  const memberBoardHit = candidates.filter(
+    (c) => !existingIds.has(c.articleId) && !ignoredIds.has(c.articleId) && isMemberOnlyBoard(c.boardName)
+  ).length;
+  console.log(`[CrawlDaemon] 목록 ${scanned}건 중 신규 후보 ${targets.length}건 본문 수집 시작... (비상품 캐시 스킵 ${ignoredHit}건, 블록 작성자 스킵 ${blockedHit}건, 회원게시판 스킵 ${memberBoardHit}건)`);
 
   let codeCursor = await computeNextProductCode();
 

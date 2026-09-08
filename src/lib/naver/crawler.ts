@@ -706,7 +706,9 @@ export async function scrapeCafeList(
   clubId: string,
   limit = 200
 ): Promise<CafeListItem[]> {
-  const MAX_PAGES = 30; // 무한 루프 안전 가드
+  // 무한 루프 안전 가드. 평소 30페이지(약 450건)면 충분하지만, 과거분을 되짚는
+  // 일회성 보정 크롤에서는 더 깊이 내려가야 해서 CRAWL_MAX_PAGES 로 올릴 수 있다. (2026-09-08)
+  const MAX_PAGES = Math.max(1, Number(process.env.CRAWL_MAX_PAGES) || 30);
   const collected = new Map<
     number,
     { articleId: number; title: string; author: string; isNotice: boolean; boardName: string | null; firstPage: number }

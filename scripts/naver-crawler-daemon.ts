@@ -161,6 +161,22 @@ export interface CrawlResult {
 // ---- 브라우저 1회 launch + 페이지 재사용 + 크래시 시 재기동 ----
 let browser: Browser | null = null;
 let pageRef: Page | null = null;
+/** 브라우저를 띄운 시각 — 주기적 교체 판단용 */
+let browserStartedAt = 0;
+
+/**
+ * 브라우저 최대 수명. 이 시간을 넘기면 **작업이 없는 동안** 새로 띄운다. (2026-09-17)
+ *
+ * 배경: 수집기는 브라우저를 한 번 띄워 계속 재사용하는데, 10분마다 카페 글 수백 개를
+ * 여는 특성상 렌더러 메모리가 회수되지 않고 쌓인다. 실측(2026-09-17): 7일 9시간 가동한
+ * 크롬이 프로세스 25개로 12.7GB를 점유했고(렌더러 하나가 2.5GB), 전체 16GB 중 남은
+ * 메모리가 4.9GB까지 떨어져 이 PC의 다른 프로그램까지 느려졌다.
+ *
+ * 세션 쿠키는 프로필 디렉터리(디스크)에 있으므로 새로 띄워도 다시 로그인하지 않는다.
+ */
+// 하한 0.01시간(36초)은 0·음수 같은 오설정만 막기 위한 것이다. 1시간으로 잡았더니
+// 짧은 값으로 동작을 검증할 수가 없었다(실제로 첫 시험이 하한에 걸려 안 돌았다).
+const BROWSER_MAX_AGE_MS = Math.max(0.01, Number(process.env.CRAWL_BROWSER_MAX_HOURS) || 6) * 60 * 60_000;
 
 async function getPage(): Promise<Page> {
   if (browser && browser.connected && pageRef && !pageRef.isClosed()) {
@@ -182,6 +198,7 @@ async function getPage(): Promise<Page> {
       '--disable-blink-features=AutomationControlled',
     ],
   });
+  browserStartedAt = Date.now();
   pageRef = await browser.newPage();
   // timeout 미지정 waitFor/goto(uploader.ts 로그인 경로 포함)까지 전부 커버하는 기본 타임아웃
   pageRef.setDefaultTimeout(30_000);
@@ -197,6 +214,7 @@ async function resetBrowser() {
   if (browser) {
     try { await browser.close(); } catch { /* 이미 죽은 브라우저 */ }
   }
+  browserStartedAt = 0;
   browser = null;
   pageRef = null;
 }
@@ -796,6 +814,15 @@ async function loop() {
       }
 
       if (!job) {
+        // 오래 띄워둔 브라우저는 여기서 교체한다. **작업이 없는 이 지점에서만** 수행하므로
+        // 크롤 도중에 브라우저가 사라지는 일은 없다. 프로필(세션 쿠키)은 디스크에 있어
+        // 다음 작업에서 getPage()가 새로 띄울 때 재로그인 없이 그대로 이어진다. (2026-09-17)
+        if (browser && browserStartedAt > 0 && Date.now() - browserStartedAt >= BROWSER_MAX_AGE_MS) {
+          const hours = ((Date.now() - browserStartedAt) / 3_600_000).toFixed(1);
+          console.log(`[CrawlDaemon] ♻️ 브라우저 ${hours}시간 가동 — 메모리 정리를 위해 교체합니다`);
+          await resetBrowser();
+        }
+
         // idle 상태에서도 생존 신호 (관리자 배너가 크롤러 IDLE/OFFLINE을 구분할 수 있게)
         if (Date.now() - lastIdleBeatAt >= 60_000) {
           lastIdleBeatAt = Date.now();

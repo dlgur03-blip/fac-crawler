@@ -1,10 +1,13 @@
-import puppeteer, { Browser, Page } from 'puppeteer';
+// 2026-10-31: 이 파일은 더 이상 브라우저를 직접 띄우지 않는다 (./shared-browser.ts 가 담당).
+// 그래서 puppeteer 본체 import 를 뺐다 — 타입만 쓴다.
+import type { Page } from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
 import axios from 'axios';
 import { createClient } from '@supabase/supabase-js';
 import { uploadDiagnosticScreenshot } from './diagnostics';
 import { applyStealth, humanType, humanClick, humanClearField, humanSettle } from './stealth';
+import { newSharedPage, releaseSharedPage } from './shared-browser';
 
 interface UploadPayload {
   type?: 'NEW' | 'REPOST';
@@ -524,19 +527,10 @@ export async function loginToNaver(page: Page): Promise<boolean> {
   return false;
 }
 
-/**
- * 작업용 탭 하나만 남기고 전부 닫는다 (2026-07-30).
- *
- * userDataDir로 크롬 프로필을 영속화하는데(로그인 세션 유지 목적), 데몬이 비정상 종료되면
- * (크래시 / taskkill / 래퍼의 강제 재시작) 크롬이 정상 종료 플래그를 남기지 못해 다음 실행에서
- * 세션 복원이 이전 탭을 전부 되살린다. 여기에 newPage()가 매번 하나씩 더 얹혀 탭이 무한 누적된다.
- * 쿠키는 탭과 무관하므로 이렇게 정리해도 로그인 세션은 유지된다.
- */
-async function closeOtherTabs(browser: Browser, keep: Page) {
-  for (const p of await browser.pages()) {
-    if (p !== keep) await p.close().catch(() => {});
-  }
-}
+// 2026-07-30에 있던 closeOtherTabs()는 2026-10-31에 제거했다.
+// 브라우저를 더 이상 열고 닫지 않으므로(공용 브라우저에 붙는다) "비정상 종료 → 탭 복원"이
+// 일어나지 않고, 탭 정리는 ./shared-browser.ts 의 pruneTabs 가 담당한다.
+// 사람이 로그인해 둔 탭까지 닫아버리면 안 되므로, 전부 닫는 방식은 공용 브라우저에 맞지 않는다.
 
 /**
  * esbuild `keepNames` 헬퍼(`__name`) 폴리필 (2026-07-30).
@@ -679,29 +673,12 @@ export async function ensurePosterSession(): Promise<{ ok: boolean; diagnostics:
   lastDiagnostics = null;
   setStage('LOGIN');
 
-  const browser = await puppeteer.launch({
-    headless: process.env.NAVER_HEADLESS === 'false' ? false : true,
-    protocolTimeout: 120_000,
-    userDataDir: process.env.NAVER_PROFILE_DIR || undefined,
-    // 자동화 자백 플래그 제거 (2026-10-02) — 상세는 ./stealth.ts 주석
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--window-size=1280,1024',
-      '--disable-blink-features=AutomationControlled',
-      '--lang=ko-KR',
-      // 프로필 영속화 + 비정상 종료 조합에서 뜨는 "복원하시겠습니까?" 버블이 클릭을 가로채는 것 방지
-      '--hide-crash-restore-bubble',
-      '--no-first-run',
-      '--no-default-browser-check',
-    ],
-  });
-
+  // 2026-10-31: 매번 launch/close 하던 것을 **공용 브라우저에 붙는 방식**으로 바꿨다.
+  // 상세 이유는 ./shared-browser.ts 주석. 요약하면 세션이 깨질 여지를 없애고,
+  // 프로필 락 때문에 브라우저를 닫아야 하는 제약을 없애기 위해서다.
   let page: Page | null = null;
   try {
-    page = await browser.newPage();
-    await closeOtherTabs(browser, page);
+    page = await newSharedPage();
     await installNameShim(page);
     await page.setViewport({ width: 1280, height: 1024 });
     await applyStealth(page);
@@ -725,7 +702,8 @@ export async function ensurePosterSession(): Promise<{ ok: boolean; diagnostics:
     const diag = await recordDiagnostics(page, 'EXCEPTION', `세션 점검 예외: ${err?.message || err}`, 'LOGIN');
     return { ok: false, diagnostics: diag };
   } finally {
-    await browser.close().catch(() => {});
+    // 탭만 닫는다. 브라우저는 계속 떠 있어야 한다 (./shared-browser.ts)
+    await releaseSharedPage(page);
   }
 }
 
@@ -779,32 +757,11 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
   // 1) 로컬에 이미지 다운로드
   const localImagePaths = await downloadImagesToLocal(payload.imageUrls, payload.productCode);
   
-  const browser = await puppeteer.launch({
-    // NAVER_HEADLESS=false 면 창 표시 — 새 기기 첫 로그인 캡차/기기확인을 눈으로 처리할 때 사용
-    headless: process.env.NAVER_HEADLESS === 'false' ? false : true,
-    // CDP 응답 무한 대기를 에러로 전환 (크롤러 데몬과 동일한 hang 방어)
-    protocolTimeout: 120_000,
-    // NAVER_PROFILE_DIR 지정 시 크롬 프로필을 영속화 → 네이버 로그인 세션 유지(매번 재로그인 방지)
-    userDataDir: process.env.NAVER_PROFILE_DIR || undefined,
-    // 자동화 자백 플래그 제거 (2026-10-02) — 상세는 ./stealth.ts 주석
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--window-size=1280,1024',
-      '--disable-blink-features=AutomationControlled',
-      '--lang=ko-KR',
-      // 프로필 영속화 + 비정상 종료 조합에서 뜨는 "복원하시겠습니까?" 버블이 클릭을 가로채는 것 방지
-      '--hide-crash-restore-bubble',
-      '--no-first-run',
-      '--no-default-browser-check',
-    ],
-  });
-
+  // 2026-10-31: 재업 1건마다 launch/close 하던 것을 **공용 브라우저에 붙는 방식**으로 바꿨다.
+  // 상세 이유는 ./shared-browser.ts 주석.
   let page: Page | null = null;
   try {
-    page = await browser.newPage();
-    await closeOtherTabs(browser, page);
+    page = await newSharedPage();
     await installNameShim(page);
     await page.setViewport({ width: 1280, height: 1024 });
     await applyStealth(page);
@@ -1309,9 +1266,9 @@ ${payload.content}
     return null;
   } finally {
     // 성공/실패/조기반환/catch 내부 예외까지 모든 경로에서 정리를 보장한다.
-    // 브라우저를 정상 종료해야 크롬이 "비정상 종료" 플래그를 남기지 않고, 다음 실행에서
-    // 세션 복원으로 탭이 되살아나는 누적을 막는다. (ensurePosterSession과 동일한 패턴)
+    // 2026-10-31부터 **탭만** 닫는다. 브라우저를 닫지 않으므로 "비정상 종료 → 탭 복원"
+    // 문제도, 세션 쿠키가 폐기될 여지도 없다. (./shared-browser.ts)
     cleanLocalTempImages(localImagePaths);
-    await browser.close().catch(() => {});
+    await releaseSharedPage(page);
   }
 }

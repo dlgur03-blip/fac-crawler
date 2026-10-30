@@ -19,11 +19,12 @@
 import fs from 'fs';
 import path from 'path';
 import { createClient } from '@supabase/supabase-js';
-import type { Browser, Page } from 'puppeteer';
+import type { Page } from 'puppeteer';
 import type { CafeListItem } from '../src/lib/naver/crawler';
 import { reportDaemonStatus } from '../src/lib/naver/daemon-status';
 import { isNonProductNotice, isMemberOnlyBoard } from '../src/lib/naver/notice-filter';
 import { applyStealth } from '../src/lib/naver/stealth';
+import { newSharedPage, releaseSharedPage } from '../src/lib/naver/shared-browser';
 import { isBlockedAuthor, normalizeCafeNickname } from '../src/lib/naver/nickname';
 
 // ---- .env.local 로드 (dotenv 없이 간단 파싱) ----
@@ -187,53 +188,40 @@ export interface CrawlResult {
   warnings: string[];
 }
 
-// ---- 브라우저 1회 launch + 페이지 재사용 + 크래시 시 재기동 ----
-let browser: Browser | null = null;
+// ---- 공용 브라우저의 탭 하나를 재사용한다 (2026-10-31) ----
+// 브라우저 자체는 ../src/lib/naver/shared-browser.ts 가 소유한다. 여기서는 탭만 들고 있다.
 let pageRef: Page | null = null;
-/** 브라우저를 띄운 시각 — 주기적 교체 판단용 */
+/** 작업용 탭을 연 시각 — 주기적 교체 판단용 */
 let browserStartedAt = 0;
 
 /**
- * 브라우저 최대 수명. 이 시간을 넘기면 **작업이 없는 동안** 새로 띄운다. (2026-09-17)
+ * 작업용 **탭**의 최대 수명. 넘기면 **작업이 없는 동안** 탭을 새로 연다. (2026-09-17 신설)
  *
- * 배경: 수집기는 브라우저를 한 번 띄워 계속 재사용하는데, 10분마다 카페 글 수백 개를
+ * 배경: 수집기는 탭을 한 번 열어 계속 재사용하는데, 10분마다 카페 글 수백 개를
  * 여는 특성상 렌더러 메모리가 회수되지 않고 쌓인다. 실측(2026-09-17): 7일 9시간 가동한
  * 크롬이 프로세스 25개로 12.7GB를 점유했고(렌더러 하나가 2.5GB), 전체 16GB 중 남은
  * 메모리가 4.9GB까지 떨어져 이 PC의 다른 프로그램까지 느려졌다.
  *
- * 세션 쿠키는 프로필 디렉터리(디스크)에 있으므로 새로 띄워도 다시 로그인하지 않는다.
+ * 2026-10-31부터 **브라우저가 아니라 탭을 교체**한다. 누수는 렌더러(탭)에 쌓이므로 효과는
+ * 같고, 사람이 로그인해 둔 창을 닫지 않아도 된다. 환경변수 이름(CRAWL_BROWSER_MAX_HOURS)은
+ * 운영 설정과의 호환을 위해 유지한다.
  */
 // 하한 0.01시간(36초)은 0·음수 같은 오설정만 막기 위한 것이다. 1시간으로 잡았더니
 // 짧은 값으로 동작을 검증할 수가 없었다(실제로 첫 시험이 하한에 걸려 안 돌았다).
 const BROWSER_MAX_AGE_MS = Math.max(0.01, Number(process.env.CRAWL_BROWSER_MAX_HOURS) || 6) * 60 * 60_000;
 
+/**
+ * 작업용 탭을 가져온다.
+ *
+ * 2026-10-31: 직접 브라우저를 띄우던 것을 **공용 브라우저에 붙는 방식**으로 바꿨다.
+ * 사람이 로그인해 둔 그 창에 그대로 붙으므로 세션을 옮길 필요가 없다.
+ * 상세 이유는 ../src/lib/naver/shared-browser.ts 주석.
+ */
 async function getPage(): Promise<Page> {
-  if (browser && browser.connected && pageRef && !pageRef.isClosed()) {
-    return pageRef;
-  }
-  await resetBrowser();
-  const puppeteer = (await import('puppeteer')).default;
-  console.log('[CrawlDaemon] 브라우저 기동 중... (프로필:', process.env.NAVER_PROFILE_DIR, ')');
-  browser = await puppeteer.launch({
-    // NAVER_HEADLESS=false 면 창 표시 — 새 기기 첫 로그인에서 캡차/기기확인을 눈으로 처리할 때 사용
-    headless: process.env.NAVER_HEADLESS === 'false' ? false : true,
-    userDataDir: process.env.NAVER_PROFILE_DIR,
-    // CDP 응답 무한 대기(hang의 전형)를 에러로 전환 — withTimeout/watchdog과 함께 3중 방어
-    protocolTimeout: 120_000,
-    // puppeteer가 기본으로 붙이는 --enable-automation 제거 (2026-10-02)
-    // 이게 붙으면 navigator.webdriver === true 가 되고 "자동화 소프트웨어가 제어 중" 띠까지 뜬다.
-    // 자동화라고 자백하는 신호라 네이버 로그인에서 불리하다.
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--window-size=1280,1024',
-      '--disable-blink-features=AutomationControlled',
-      '--lang=ko-KR',
-    ],
-  });
-  browserStartedAt = Date.now();
-  pageRef = await browser.newPage();
+  if (pageRef && !pageRef.isClosed()) return pageRef;
+
+  pageRef = await newSharedPage();
+  browserStartedAt = Date.now(); // 이제는 '탭을 연 시각'이다
   // timeout 미지정 waitFor/goto(uploader.ts 로그인 경로 포함)까지 전부 커버하는 기본 타임아웃
   pageRef.setDefaultTimeout(30_000);
   pageRef.setDefaultNavigationTimeout(35_000);
@@ -244,12 +232,16 @@ async function getPage(): Promise<Page> {
   return pageRef;
 }
 
+/**
+ * 작업용 **탭만** 버린다. 브라우저는 닫지 않는다 (2026-10-31).
+ *
+ * 메모리 누수는 탭(렌더러)에 쌓인다 — 2026-09-17 실측에서 렌더러 하나가 2.5GB였다.
+ * 그래서 탭을 버리는 것으로 같은 효과를 낸다. 브라우저를 닫으면 사람이 로그인해 둔
+ * 창까지 사라지고, 다시 띄울 때 탭 복원·세션 문제가 생긴다.
+ */
 async function resetBrowser() {
-  if (browser) {
-    try { await browser.close(); } catch { /* 이미 죽은 브라우저 */ }
-  }
+  await releaseSharedPage(pageRef);
   browserStartedAt = 0;
-  browser = null;
   pageRef = null;
 }
 
@@ -865,18 +857,38 @@ async function processJob(job: any) {
 }
 
 let lastIdleBeatAt = 0; // idle 생존 신호 스로틀
+let lastScheduledAt = Date.now(); // 기동 후 첫 자동 크롤까지의 기준점
 
-async function loop() {
+/** 기동 시 한 번 — 좀비 PROCESSING 회수 + watchdog 기동 */
+export async function crawlStartup() {
   console.log('[CrawlDaemon] 🟢 네이버 카페 크롤러 데몬 시작. 큐 폴링 중... (Ctrl+C 종료)');
   console.log('[CrawlDaemon] 카페 clubId:', CLUB_ID, '/ 프로필 경로:', process.env.NAVER_PROFILE_DIR);
 
   // 기동 직후 좀비 PROCESSING 회수 — 이전 프로세스가 hang 중 죽었어도 자동 크롤 재개 가능하게
   await recoverStaleJobs();
   startWatchdog();
+}
 
-  let lastScheduledAt = Date.now(); // 기동 후 10분 뒤 첫 자동 크롤
+/**
+ * 브라우저를 닫아 크롬 프로필 락을 풀어준다 (2026-10-30 신설).
+ *
+ * 통합 데몬이 재업 차례로 넘어가기 전에 호출한다. 크롬 프로필은 **두 프로세스가 동시에
+ * 열 수 없으므로**, 수집과 재업이 같은 프로필을 쓰려면 한쪽이 반드시 닫아야 한다.
+ * 세션 쿠키는 디스크에 영구 저장되므로(상태유지 ON) 닫아도 로그인은 유지된다.
+ */
+export async function releaseCrawlBrowser() {
+  await resetBrowser();
+}
 
-  while (true) {
+/**
+ * 루프 한 바퀴 (2026-10-30 분리).
+ *
+ * 수집과 재업을 **한 프로세스에서 번갈아** 돌리기 위해 떼어냈다.
+ * 전에는 두 데몬이 각자 프로필을 갖고 같은 계정으로 따로 로그인했는데, 네이버 입장에서는
+ * 한 아이디가 기기 두 대로 접속하는 모양이었다. 거기에 사람이 쓰는 휴대폰까지 겹쳐
+ * 2026-10-30 하루에 보호조치가 두 번 걸렸다. 동시 실행을 없애는 것이 이 분리의 목적이다.
+ */
+export async function crawlTick() {
     try {
       // 절전에서 깨어났으면 다음 주기를 기다리지 않고 **바로** 한 번 돈다. (2026-10-30)
       // 2026-10-28에 사람이 PC를 재웠고(모던 대기), 자는 동안 세션이 삭아 깨어난 뒤
@@ -940,12 +952,12 @@ async function loop() {
       }
 
       if (!job) {
-        // 오래 띄워둔 브라우저는 여기서 교체한다. **작업이 없는 이 지점에서만** 수행하므로
-        // 크롤 도중에 브라우저가 사라지는 일은 없다. 프로필(세션 쿠키)은 디스크에 있어
-        // 다음 작업에서 getPage()가 새로 띄울 때 재로그인 없이 그대로 이어진다. (2026-09-17)
-        if (browser && browserStartedAt > 0 && Date.now() - browserStartedAt >= BROWSER_MAX_AGE_MS) {
+        // 오래 쓴 작업 탭은 여기서 교체한다. **작업이 없는 이 지점에서만** 수행하므로
+        // 크롤 도중에 탭이 사라지는 일은 없다. 브라우저는 그대로 떠 있고 로그인도 유지된다.
+        // (2026-09-17 도입 / 2026-10-31 브라우저 교체 → 탭 교체로 변경)
+        if (pageRef && browserStartedAt > 0 && Date.now() - browserStartedAt >= BROWSER_MAX_AGE_MS) {
           const hours = ((Date.now() - browserStartedAt) / 3_600_000).toFixed(1);
-          console.log(`[CrawlDaemon] ♻️ 브라우저 ${hours}시간 가동 — 메모리 정리를 위해 교체합니다`);
+          console.log(`[CrawlDaemon] ♻️ 작업 탭 ${hours}시간 사용 — 메모리 정리를 위해 새 탭으로 교체합니다`);
           await resetBrowser();
         }
 
@@ -955,7 +967,7 @@ async function loop() {
           await reportDaemonStatus({ name: 'crawler', state: 'IDLE', detail: { clubId: CLUB_ID } });
         }
         await sleep(POLL_MS);
-        continue;
+        return; // 한 바퀴 끝 (전에는 while 루프의 continue 였다)
       }
 
       try {
@@ -984,7 +996,14 @@ async function loop() {
       console.error('[CrawlDaemon] 루프 오류:', loopErr?.message);
       await sleep(POLL_MS);
     }
-  }
 }
 
-loop();
+/** 수집기만 단독으로 돌릴 때의 루프 */
+async function loop() {
+  await crawlStartup();
+  while (true) await crawlTick();
+}
+
+// 통합 데몬(scripts/naver-unified-daemon.ts)이 import 할 때는 자체 루프를 돌리지 않는다.
+// 통합 데몬이 수집·재업을 번갈아 호출하므로 여기서 또 돌면 동시 실행이 된다.
+if (process.env.NAVER_DAEMON_MODE !== 'unified') loop();

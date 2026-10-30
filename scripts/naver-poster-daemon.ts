@@ -280,15 +280,24 @@ async function refreshSessionIfDue() {
   }
 }
 
-async function loop() {
+/** 기동 시 한 번 — 생존 신호 + 즉시 세션 점검 */
+export async function posterStartup() {
   console.log('[Daemon] 🟢 네이버 카페 포스팅 데몬 시작. 큐 폴링 중... (Ctrl+C 종료)');
   console.log('[Daemon] 프로필 경로:', process.env.NAVER_PROFILE_DIR);
   console.log(`[Daemon] 세션 점검: ${SESSION_MIN_MIN}~${SESSION_MAX_MIN}분 사이 무작위 (이번 대기 ${Math.round(sessionIntervalMs/60000)}분)`);
   await beat('IDLE');
   // 기동 직후 1회 세션 점검 — 새 PC 설치 후 로그인 상태를 바로 확인할 수 있게 한다
   await refreshSessionIfDue().catch((e) => console.warn('[Daemon] 초기 세션 점검 실패:', e?.message));
+}
 
-  while (true) {
+/**
+ * 루프 한 바퀴 (2026-10-30 분리).
+ *
+ * 통합 데몬이 수집과 번갈아 호출한다. 재업은 작업마다 자기 브라우저를 열고 닫으므로
+ * (uploadToNaverCafe / ensurePosterSession), 수집기가 브라우저를 닫아둔 동안에만 돌면
+ * 같은 프로필을 안전하게 공유할 수 있다.
+ */
+export async function posterTick() {
     try {
       // 절전에서 깨어났으면 **기다리지 않고 바로** 세션을 점검한다. (2026-10-30)
       // 자는 동안 네이버 세션이 삭는다. 다음 주기(최대 20분)까지 두면 그 사이에 들어온
@@ -307,7 +316,7 @@ async function loop() {
         if (Date.now() - lastHeartbeatAt >= HEARTBEAT_MS) await beat('IDLE');
         await refreshSessionIfDue().catch((e) => console.warn('[Daemon] 세션 점검 실패:', e?.message));
         await sleep(POLL_MS);
-        continue;
+        return; // 한 바퀴 끝 (전에는 while 루프의 continue 였다)
       }
       try {
         await processJob(job);
@@ -355,7 +364,13 @@ async function loop() {
       console.error('[Daemon] 루프 오류:', loopErr?.message);
       await sleep(POLL_MS);
     }
-  }
 }
 
-loop();
+/** 재업기만 단독으로 돌릴 때의 루프 */
+async function loop() {
+  await posterStartup();
+  while (true) await posterTick();
+}
+
+// 통합 데몬(scripts/naver-unified-daemon.ts)이 import 할 때는 자체 루프를 돌리지 않는다.
+if (process.env.NAVER_DAEMON_MODE !== 'unified') loop();

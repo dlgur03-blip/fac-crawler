@@ -247,40 +247,32 @@ async function humanType(page, selector, text) {
   log(`  아이디 ${ID}`);
   log(`  프로필 존재: ${fs.existsSync(profileDir) ? '예' : '아니오 (새로 만듭니다)'}\n`);
 
-  const browser = await puppeteer.launch({
-    headless: false,
-    userDataDir: profileDir,
-    defaultViewport: null,
-    // 데몬이 강제 종료되면 크롬이 정상 종료 플래그를 못 남겨 다음 실행에서 **이전 탭을
-    // 전부 복원**한다. 2026-10-02에 18개가 되살아나 CDP 호출이 타임아웃으로 죽었고,
-    // 2026-10-30에 같은 자리에서 또 막혔다. 넉넉히 주고, 아래에서 탭을 정리한다.
-    protocolTimeout: 300_000,
-    // 자동화 자백 플래그 제거
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--lang=ko-KR',
-      '--window-size=1150,950',
-      '--window-position=100,50',
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--hide-crash-restore-bubble',
-    ],
-  });
+  // 2026-10-31: 직접 띄우지 않고 **공용 크롬에 붙는다.**
+  //
+  // 전에는 puppeteer.launch 로 띄웠는데, 그러면 크롬이 이 스크립트의 자식이 되어
+  // 스크립트가 끝나는 순간 **로그인 창이 함께 사라졌다.** 그래서 로그인해도 데몬이 쓸
+  // 창이 남지 않았다. 이제는 분리 실행된 크롬에 붙고, 끝낼 때 연결만 끊는다.
+  const { ensureBrowser } = require(path.join(ROOT, 'scripts', 'lib', 'ensure-browser.js'));
+  const { browser, spawned, endpoint } = await ensureBrowser(puppeteer, profileDir, { headless: false });
+  log(spawned ? '크롬을 새로 띄웠습니다 (분리 실행)' : '이미 떠 있는 크롬에 붙었습니다');
+  log('  디버깅 주소: ' + String(endpoint).replace(/\/devtools.*/, ''));
 
-  // 복원된 탭 정리 — 하나만 남긴다. 탭이 많으면 CDP가 느려져 아래 호출들이 타임아웃난다.
+  // 복원된 탭 정리 (2026-10-31 수정).
+  //
+  // 전에는 "1개만 남기고 닫기" 였는데, 남긴 그 탭이 복원 과정에서 떨어져 나간 프레임이면
+  // 이후 호출이 `Attempted to use detached Frame` 으로 죽는다(2026-10-31에 29개 복원 중 발생).
+  // 그래서 **새 탭을 먼저 만들고 기존 탭을 전부 닫는다.** 새 탭을 먼저 만드는 이유는,
+  // 마지막 탭을 닫으면 브라우저가 함께 종료되기 때문이다.
+  let page;
   {
     const opened = await browser.pages();
-    if (opened.length > 1) {
-      log(`복원된 탭 ${opened.length}개 — 1개만 남기고 닫습니다`);
-      for (const p of opened.slice(1)) {
-        try { await p.close(); } catch { /* 이미 닫힘 */ }
-      }
-      await new Promise((r) => setTimeout(r, 1000));
+    if (opened.length > 1) log(`복원된 탭 ${opened.length}개 — 전부 닫고 새 탭을 엽니다`);
+    page = await browser.newPage();
+    for (const p of opened) {
+      try { await p.close(); } catch { /* 이미 닫힘 */ }
     }
+    await new Promise((r) => setTimeout(r, 800));
   }
-
-  const page = (await browser.pages())[0] || (await browser.newPage());
   page.setDefaultTimeout(60_000);
 
   // 평범한 브라우저처럼 보이게 — 페이지마다 문서 생성 시점에 적용
@@ -298,8 +290,10 @@ async function humanType(page, selector, text) {
 
   await page.goto('https://www.naver.com', { waitUntil: 'domcontentloaded', timeout: 60_000 });
   if (await isLoggedIn(page)) {
-    log('✅ 이미 로그인되어 있습니다. 아무것도 하지 않고 닫습니다.');
-    await browser.close();
+    // 닫지 않는다 — 이 창에 데몬이 붙는다 (2026-10-31)
+    browser.disconnect();
+    log('✅ 이미 로그인되어 있습니다. 창을 그대로 띄워 둡니다 — 이 창을 닫지 마세요.');
+    log('   이제 통합 데몬을 켜면 됩니다:  npm run unified-daemon');
     return;
   }
 
@@ -358,30 +352,67 @@ async function humanType(page, selector, text) {
 
   log('✅ 로그인 성공 (NID_AUT·NID_SES 발급 확인)');
 
-  // 카페 본문을 읽을 수 있는 등급인지 — 못 읽으면 수집이 조용히 빠진다
+  // 카페 본문을 읽을 수 있는지 — 못 읽으면 수집이 글을 조용히 빠뜨린다.
+  //
+  // 2026-10-31 수정: 전에는 글 번호 427165를 **하드코딩**해서 확인했다. 그 글이 삭제되면
+  // HTTP 500이 나고, 그걸 "계정 등급 문제"로 잘못 보고한다(실제로 그렇게 오진했다).
+  // 지금은 **최근 글 목록에서 실제 글 번호를 받아** 그 글을 읽는다.
+  const CLUB = process.env.NAVER_CAFE_CLUB_ID || '28310071';
   try {
-    await page.goto('https://m.cafe.naver.com/ca-fe/web/cafes/28310071', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await page.goto(`https://m.cafe.naver.com/ca-fe/web/cafes/${CLUB}`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     await new Promise((r) => setTimeout(r, 2500));
-    const cafe = await page.evaluate(async () => {
-      const res = await fetch(
-        'https://apis.naver.com/cafe-web/cafe-articleapi/v3/cafes/28310071/articles/427165?query=&useCafeId=true',
+
+    const check = await page.evaluate(async (clubId) => {
+      // 1) 최근 글 목록에서 글 번호 하나를 얻는다
+      const listUrl =
+        `https://apis.naver.com/cafe-web/cafe2/ArticleListV2dot1.json` +
+        `?search.clubid=${clubId}&search.queryType=lastArticle&search.page=1&search.perPage=5`;
+      const listRes = await fetch(listUrl, { credentials: 'include' });
+      let articleId = null;
+      let listStatus = listRes.status;
+      try {
+        const lj = await listRes.json();
+        const arr = lj?.message?.result?.articleList || [];
+        const found = arr.find((a) => a && a.articleId);
+        if (found) articleId = found.articleId;
+      } catch { /* 파싱 실패 */ }
+
+      if (!articleId) return { stage: 'LIST', listStatus, articleId: null, status: null, subject: null };
+
+      // 2) 그 글의 본문을 읽어본다
+      const artRes = await fetch(
+        `https://apis.naver.com/cafe-web/cafe-articleapi/v3/cafes/${clubId}/articles/${articleId}?query=&useCafeId=true`,
         { credentials: 'include' }
       );
-      const json = await res.json();
-      return { status: res.status, subject: json?.result?.article?.subject ?? null };
-    });
-    log(
-      cafe.subject
-        ? `✅ 카페 본문 읽기 성공 — "${String(cafe.subject).slice(0, 45)}"`
-        : `⚠️ 카페 본문 읽기 실패 (HTTP ${cafe.status}) — 계정 등급 확인 필요`
-    );
+      let subject = null;
+      try {
+        const aj = await artRes.json();
+        subject = aj?.result?.article?.subject ?? null;
+      } catch { /* 파싱 실패 */ }
+      return { stage: 'ARTICLE', listStatus, articleId, status: artRes.status, subject };
+    }, CLUB);
+
+    if (check.subject) {
+      log(`✅ 카페 본문 읽기 성공 (글 ${check.articleId}) — "${String(check.subject).slice(0, 45)}"`);
+    } else if (check.stage === 'LIST') {
+      log(`⚠️ 카페 글 목록을 못 받았습니다 (HTTP ${check.listStatus}) — 로그인은 됐으나 카페 접근 확인 불가`);
+    } else {
+      log(`⚠️ 글 ${check.articleId} 본문 읽기 실패 (HTTP ${check.status}) — 등급 또는 글 상태 확인 필요`);
+    }
   } catch (e) {
     log('⚠️ 카페 확인 중 오류: ' + e.message);
   }
 
-  await new Promise((r) => setTimeout(r, 1500));
-  await browser.close();
-  log('\n세션이 프로필에 저장됐습니다. 데몬을 다시 켜도 됩니다.');
+  await new Promise((r) => setTimeout(r, 1000));
+
+  // ⚠️ 브라우저를 **닫지 않는다** (2026-10-31).
+  // 이 창을 그대로 띄워두고 데몬이 여기에 붙는다. 닫으면 데몬이 새로 띄워야 하고,
+  // 그 과정에서 세션·탭 복원 문제가 다시 생긴다. 연결만 끊는다.
+  browser.disconnect();
+  log('');
+  log('✅ 로그인된 창을 그대로 띄워 둡니다. 이 창을 닫지 마세요.');
+  log('   데몬이 이 창에 붙어서 수집·재업을 합니다 (디버깅 포트 ' + (process.env.NAVER_DEBUG_PORT || '9222') + ').');
+  log('   이제 통합 데몬을 켜면 됩니다:  npm run unified-daemon');
 })().catch((e) => {
   log('실패: ' + e.message);
   if (/profile|ProcessSingleton|in use/i.test(e.message)) {

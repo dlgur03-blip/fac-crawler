@@ -6,7 +6,8 @@
   "scripts": {
     "crawler-daemon": "tsx scripts/naver-crawler-daemon.ts",
     "typecheck": "tsc --noEmit",
-    "naver-daemon": "tsx scripts/naver-poster-daemon.ts"
+    "naver-daemon": "tsx scripts/naver-poster-daemon.ts",
+    "unified-daemon": "tsx scripts/naver-unified-daemon.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.106.0",

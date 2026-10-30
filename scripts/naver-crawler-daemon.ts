@@ -23,6 +23,8 @@ import type { Browser, Page } from 'puppeteer';
 import type { CafeListItem } from '../src/lib/naver/crawler';
 import { reportDaemonStatus } from '../src/lib/naver/daemon-status';
 import { isNonProductNotice, isMemberOnlyBoard } from '../src/lib/naver/notice-filter';
+import { applyStealth } from '../src/lib/naver/stealth';
+import { isBlockedAuthor, normalizeCafeNickname } from '../src/lib/naver/nickname';
 
 // ---- .env.local 로드 (dotenv 없이 간단 파싱) ----
 (function loadEnv() {
@@ -54,7 +56,34 @@ if (!SUPA_URL || !SVC) {
 const sb = createClient(SUPA_URL, SVC, { auth: { persistSession: false } });
 
 const POLL_MS = 15_000;          // 큐 폴링 주기
-const SCHEDULE_MS = 10 * 60_000; // 자체 스케줄 크롤 주기 (10분)
+
+/**
+ * 자체 스케줄 크롤 주기 — **매번 무작위로 뽑는다.** (2026-10-30 대표님 지시)
+ *
+ * 그전에는 정확히 10분마다 돌았다. 10:00·10:10·10:20… 시계처럼 규칙적이라 자동화로
+ * 드러나기 쉽다. 게다가 한 번에 글 200개를 여는 동작이라 재업보다 더 눈에 띈다.
+ * 평균은 그대로 두고 간격만 흩뜨려 상품 유입 속도는 유지한다.
+ */
+const CRAWL_MIN_MIN = Math.max(1, Number(process.env.CRAWL_SCHEDULE_MIN_MINUTES || 8));
+const CRAWL_MAX_MIN = Math.max(CRAWL_MIN_MIN, Number(process.env.CRAWL_SCHEDULE_MAX_MINUTES || 13));
+
+/** 다음 자동 크롤까지 기다릴 시간을 [최소, 최대] 사이에서 새로 뽑는다 */
+function pickScheduleInterval(): number {
+  const span = CRAWL_MAX_MIN - CRAWL_MIN_MIN;
+  return Math.round((CRAWL_MIN_MIN + Math.random() * span) * 60 * 1000);
+}
+
+/** 이번에 뽑힌 대기 시간 — 작업을 만들 때마다 다시 뽑는다 */
+let scheduleIntervalMs = pickScheduleInterval();
+
+/**
+ * 절전 복귀 판정 기준 — 폴링 한 바퀴가 이 시간을 넘으면 그 사이 잠들어 있었다고 본다.
+ * 절전 중에는 setTimeout도 멈추므로 실제 경과 시간으로만 알 수 있다. (2026-10-30)
+ */
+const WAKE_GAP_MS = 3 * 60_000;
+/** 직전 루프 시각 — 절전 복귀 감지용 */
+let lastTickAt = Date.now();
+
 const HEARTBEAT_MS = 60_000;     // 크롤 중 crawl_queue.updated_at 갱신 주기 (스로틀)
 const STALL_MS = 10 * 60_000;    // watchdog: 작업 중 무진행 10분이면 좀비로 판정 (아이템 1건 최악 ~2분의 5배)
 const STALE_JOB_MS = 15 * 60_000;// 큐의 PROCESSING 행이 15분 무갱신이면 죽은 데몬의 잔재로 판정
@@ -191,11 +220,16 @@ async function getPage(): Promise<Page> {
     userDataDir: process.env.NAVER_PROFILE_DIR,
     // CDP 응답 무한 대기(hang의 전형)를 에러로 전환 — withTimeout/watchdog과 함께 3중 방어
     protocolTimeout: 120_000,
+    // puppeteer가 기본으로 붙이는 --enable-automation 제거 (2026-10-02)
+    // 이게 붙으면 navigator.webdriver === true 가 되고 "자동화 소프트웨어가 제어 중" 띠까지 뜬다.
+    // 자동화라고 자백하는 신호라 네이버 로그인에서 불리하다.
+    ignoreDefaultArgs: ['--enable-automation'],
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--window-size=1280,1024',
       '--disable-blink-features=AutomationControlled',
+      '--lang=ko-KR',
     ],
   });
   browserStartedAt = Date.now();
@@ -204,9 +238,9 @@ async function getPage(): Promise<Page> {
   pageRef.setDefaultTimeout(30_000);
   pageRef.setDefaultNavigationTimeout(35_000);
   await pageRef.setViewport({ width: 1280, height: 1024 });
-  await pageRef.setUserAgent(
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  );
+  await applyStealth(pageRef);
+  // UA는 덮어쓰지 않는다 (2026-10-02). 예전에는 '맥 크롬 120'으로 위장했는데 실제는 윈도우
+  // 크롬이라, 플랫폼·폰트·WebGL 신호와 전부 어긋나 평범한 브라우저보다 오히려 더 튀었다.
   return pageRef;
 }
 
@@ -219,15 +253,42 @@ async function resetBrowser() {
   pageRef = null;
 }
 
+/**
+ * 로그인이 사람 손을 기다리는 상태인지 (2026-10-02).
+ * true가 되면 10분 주기 자동 크롤을 만들지 않는다 — 실패 작업만 쌓이고, 그 과정에서
+ * 비밀번호가 반복 제출돼 네이버가 계정에 보호조치를 걸기 때문이다.
+ */
+let loginNeedsHuman = false;
+
 async function ensureLogin(page: Page) {
-  const { loginToNaver } = await import('../src/lib/naver/uploader');
+  const { loginToNaver, getLastLoginSignals } = await import('../src/lib/naver/uploader');
   const ok = await loginToNaver(page);
-  if (!ok) {
-    throw new Error('네이버 로그인 실패 (캡차/계정정보/세션 만료 가능)');
+  if (ok) {
+    loginNeedsHuman = false;
+    return;
   }
+  const note = getLastLoginSignals().note;
+  // 캡차·기기확인·자체 차단은 사람이 창에서 한 번 로그인해 줘야 풀린다. 계속 시도해도 소용없다.
+  if (note === 'LOGIN_BLOCKED_LOCAL' || note === 'CAPTCHA' || note === 'DEVICE_CONFIRM') {
+    loginNeedsHuman = true;
+  }
+  throw new Error(`네이버 로그인 실패 (${note || '원인불명'})`);
 }
 
 // ---- 상품코드 생성: /api/products/create와 동일한 9자리 순차 코드 정책 ----
+/**
+ * 크롤 상품의 다음 상품코드. **1억번대만 쓴다.**
+ *
+ * 2026-10-13 사고 수정: 예전에는 1억~9억 전 구간에서 최대값+1을 집었다. 그런데 고객
+ * 셀프 주문서(2026-10-10 신설)가 9억번대를 쓰기 시작하자 **크롤러가 만드는 정상 상품도
+ * 9억번대를 받았다.** 관리자 목록이 9억번대를 셀프 주문으로 보고 숨기는 바람에, 10/12에
+ * 수집된 로레알 상품 150건이 통째로 사라져 "업로드가 하나도 안 됐다"는 제보로 올라왔다.
+ *
+ * 대역을 섞지 않는다 — 크롤은 1억번대, 셀프 주문은 9억번대.
+ */
+const CRAWL_CODE_MIN = 100000000;
+const CRAWL_CODE_MAX = 199999999;
+
 async function computeNextProductCode(): Promise<number> {
   let next = 100000001;
   try {
@@ -239,7 +300,8 @@ async function computeNextProductCode(): Promise<number> {
     if (latestProducts && latestProducts.length > 0) {
       const numericCodes = latestProducts
         .map((p: any) => parseInt(p.product_code, 10))
-        .filter((code: number) => !isNaN(code) && code >= 100000000 && code <= 999999999);
+        // 9억번대(셀프 주문서)는 제외한다 — 섞이면 크롤 상품이 그 대역으로 끌려간다
+        .filter((code: number) => !isNaN(code) && code >= CRAWL_CODE_MIN && code <= CRAWL_CODE_MAX);
 
       if (numericCodes.length > 0) {
         next = Math.max(...numericCodes) + 1;
@@ -354,13 +416,13 @@ async function runCrawl(page: Page, jobId: string, limit = 200, stopAfterDupes =
   // (목록의 author는 폴백 체인이라 빈 값일 수 있음 — 상세 파싱 후 이중 가드 있음)
   const targets = candidates
     .filter((c) => !existingIds.has(c.articleId) && !ignoredIds.has(c.articleId))
-    .filter((c) => !blockedAuthors.has((c.author || '').trim()))
+    .filter((c) => !isBlockedAuthor(c.author, blockedAuthors))
     // 회원 벼룩 게시판 글은 본문조차 열지 않는다 — 회원 개인 물건이 몰 상품이 되면 안 된다 (2026-09-07)
     .filter((c) => !isMemberOnlyBoard(c.boardName))
     .sort((a, b) => a.articleId - b.articleId);
 
   const ignoredHit = candidates.filter((c) => !existingIds.has(c.articleId) && ignoredIds.has(c.articleId)).length;
-  const blockedHit = candidates.filter((c) => blockedAuthors.has((c.author || '').trim())).length;
+  const blockedHit = candidates.filter((c) => isBlockedAuthor(c.author, blockedAuthors)).length;
   const memberBoardHit = candidates.filter(
     (c) => !existingIds.has(c.articleId) && !ignoredIds.has(c.articleId) && isMemberOnlyBoard(c.boardName)
   ).length;
@@ -405,7 +467,7 @@ async function runCrawl(page: Page, jobId: string, limit = 200, stopAfterDupes =
       }
 
       // 작성자 블록리스트 이중 가드 — 목록 author가 빈 값이어도 상세에서 확실히 차단 + 캐시로 재진입 방지
-      if (detail.authorNickname && blockedAuthors.has(detail.authorNickname.trim())) {
+      if (isBlockedAuthor(detail.authorNickname, blockedAuthors)) {
         await markIgnored(t.articleId, 'blocked_author', detail.title);
         console.log(`[CrawlDaemon] ⛔ #${t.articleId} 블록 작성자(${detail.authorNickname.trim()}) — 스킵 캐시 등록`);
         continue;
@@ -426,7 +488,7 @@ async function runCrawl(page: Page, jobId: string, limit = 200, stopAfterDupes =
           const orig = await withTimeout(scrapeCafeDetail(page, CLUB_ID, ref.articleId), 90_000, `scrapeOrigin #${ref.articleId}`);
 
           // 원본 작성자가 블록리스트면 끌올 글째로 영구 스킵
-          if (orig && orig.authorNickname && blockedAuthors.has(orig.authorNickname.trim())) {
+          if (orig && isBlockedAuthor(orig.authorNickname, blockedAuthors)) {
             await markIgnored(t.articleId, 'blocked_author', detail.title);
             console.log(`[CrawlDaemon] ⛔ #${t.articleId} 끌올 원본(#${ref.articleId}) 작성자 블록 — 스킵 캐시 등록`);
             repostHandled = true;
@@ -437,7 +499,7 @@ async function runCrawl(page: Page, jobId: string, limit = 200, stopAfterDupes =
             // ★ 기적재 원본의 끌올 → 최신 정보로 UPDATE + posted_at 전진
             const { data: prod } = await sb
               .from('products')
-              .select('id, posted_at')
+              .select('id, posted_at, title, is_soldout')
               .eq('cafe_article_id', ref.articleId)
               .maybeSingle();
             const newPostedAt = detail.postedAt || new Date().toISOString();
@@ -456,8 +518,20 @@ async function runCrawl(page: Page, jobId: string, limit = 200, stopAfterDupes =
                 // 파싱값이 비어있으면 필드 제외 — 어드민 수동 보정값 보호
                 if (orig.sizes) upd.sizes = orig.sizes;
                 if (orig.colors) upd.colors = orig.colors;
-                if (orig.authorNickname) upd.author_nickname = orig.authorNickname.trim();
-                upd.is_soldout = detectSoldoutFromTitle(detail.title) || detectSoldoutFromTitle(orig.title);
+                if (orig.authorNickname) upd.author_nickname = normalizeCafeNickname(orig.authorNickname);
+
+                // 품절은 **제목이 바뀐 끌올에서만** 다시 판정한다. (2026-10-16)
+                //
+                // 예전에는 끌올마다 제목으로 재계산해 덮어썼다. 그래서 관리자가 품절을
+                // 손으로 풀어도 다음 끌올에서 도로 품절이 됐다. 현장 제보가 정확히
+                // 그것이었다 — "수량 변경해도 자꾸 품절로 표기된다".
+                // 제목이 그대로면 카페 쪽 정보가 안 바뀐 것이므로 관리자 판단을 존중하고,
+                // 제목이 바뀌었으면(품절 표기가 붙거나 빠졌으면) 그때만 반영한다.
+                const prevTitle = String((prod as { title?: string }).title ?? '');
+                const titleChanged = !!orig.title && orig.title !== prevTitle;
+                if (titleChanged) {
+                  upd.is_soldout = detectSoldoutFromTitle(detail.title) || detectSoldoutFromTitle(orig.title);
+                }
                 // 가격 변동 시 dedup_key 재계산 (충돌 시 키 갱신만 생략)
                 const newKey = buildDedupKey(orig.title, orig.sourcePrice);
                 const { error: keyErr } = await sb.from('products').update({ dedup_key: newKey }).eq('id', prod.id).neq('dedup_key', newKey);
@@ -538,7 +612,8 @@ async function runCrawl(page: Page, jobId: string, limit = 200, stopAfterDupes =
       const postedAt = detail.postedAt || new Date().toISOString();
       const articleUrl = `https://cafe.naver.com/f-e/cafes/${CLUB_ID}/articles/${t.articleId}`;
       const price = sourcePrice + detail.fee;
-      const authorNickname = detail.authorNickname ? detail.authorNickname.trim() : null;
+      // 카페가 닉네임 뒤에 직함·등급을 붙여 내려준다 — 저장 전에 본체만 남긴다 (2026-10-23)
+      const authorNickname = detail.authorNickname ? normalizeCafeNickname(detail.authorNickname) || null : null;
       const managerId = authorNickname ? managerMap.get(authorNickname) || null : null;
       const titleSoldout = detectSoldoutFromTitle(detail.title); // 제목 품절 표기 → 자동 품절
 
@@ -552,7 +627,7 @@ async function runCrawl(page: Page, jobId: string, limit = 200, stopAfterDupes =
       }
 
       // 최종 블록 가드 — 링크 경로에서 닉네임이 뒤늦게 채워진 경우 대비
-      if (authorNickname && blockedAuthors.has(authorNickname)) {
+      if (isBlockedAuthor(authorNickname, blockedAuthors)) {
         await markIgnored(t.articleId, 'blocked_author', detail.title);
         console.log(`[CrawlDaemon] ⛔ #${t.articleId} 블록 작성자(${authorNickname}) — 적재 직전 차단`);
         continue;
@@ -561,7 +636,7 @@ async function runCrawl(page: Page, jobId: string, limit = 200, stopAfterDupes =
       // 재게시(끌어올림) 판정
       const { data: existing, error: dupErr } = await sb
         .from('products')
-        .select('id, posted_at')
+        .select('id, posted_at, title')
         .eq('dedup_key', dedupKey)
         .maybeSingle();
 
@@ -585,8 +660,14 @@ async function runCrawl(page: Page, jobId: string, limit = 200, stopAfterDupes =
             price,
             content: detail.content,
             author_nickname: authorNickname,
-            is_soldout: titleSoldout, // 재게시 제목 기준 품절 동기화 (표기 빠지면 해제)
           };
+          // 품절은 **제목이 바뀐 재게시에서만** 다시 판정한다. (2026-10-16)
+          // dedup_key가 제목+가격으로 만들어지므로 여기 걸렸다는 건 제목이 사실상 같다는 뜻이다.
+          // 그런데도 매번 덮어쓰는 바람에 관리자가 손으로 푼 품절이 도로 켜졌다
+          // ("수량 변경해도 자꾸 품절로 표기된다" — 2026-10-16 현장 제보).
+          if (detail.title && detail.title !== String((existing as { title?: string }).title ?? '')) {
+            repostUpd.is_soldout = titleSoldout;
+          }
           // 옵션은 파싱값이 있을 때만 갱신 — 빈 값으로 어드민 수동 보정을 덮지 않음
           if (detail.sizes) repostUpd.sizes = detail.sizes;
           if (detail.colors) repostUpd.colors = detail.colors;
@@ -797,6 +878,19 @@ async function loop() {
 
   while (true) {
     try {
+      // 절전에서 깨어났으면 다음 주기를 기다리지 않고 **바로** 한 번 돈다. (2026-10-30)
+      // 2026-10-28에 사람이 PC를 재웠고(모던 대기), 자는 동안 세션이 삭아 깨어난 뒤
+      // 로그인이 막혔다. 복귀 직후 바로 돌려 세션 상태를 확인하고, 밀린 수집도 당긴다.
+      // 절전 중에는 setTimeout도 멈추므로 루프 한 바퀴의 실제 경과 시간으로 판정한다.
+      {
+        const gap = Date.now() - lastTickAt;
+        lastTickAt = Date.now();
+        if (gap > WAKE_GAP_MS) {
+          console.log(`[CrawlDaemon] ⏰ ${Math.round(gap / 60000)}분 공백 감지 (절전 복귀 추정) — 즉시 크롤`);
+          lastScheduledAt = 0; // 주기를 무시하고 지금 작업을 만들게 한다
+        }
+      }
+
       markProgress(); // idle 폴링도 진행으로 간주 (watchdog은 작업 중일 때만 무진행 판정)
       await recoverStaleJobs();
 
@@ -804,12 +898,44 @@ async function loop() {
       let job = await claimJob();
 
       // (B) 10분 경과 시 자체 SCHEDULED 작업 생성 → 동일 process 경로 (모든 실행이 큐에 로그로 남음)
-      if (!job && Date.now() - lastScheduledAt >= SCHEDULE_MS) {
+      if (!job && Date.now() - lastScheduledAt >= scheduleIntervalMs) {
         lastScheduledAt = Date.now();
-        const busy = await hasActiveJob();
-        if (!busy) {
-          job = await createScheduledJob();
-          if (job) console.log(`[CrawlDaemon] ⏰ 10분 주기 자동 크롤 작업 생성 (job ${job.id})`);
+        scheduleIntervalMs = pickScheduleInterval(); // 다음 간격을 새로 뽑는다
+        if (loginNeedsHuman) {
+          // 로그인이 사람 손을 기다리는 상태면 작업을 만들지 않는다 (2026-10-02).
+          // 만들어 봐야 전부 로그인 실패로 끝나고, 그때마다 비밀번호가 한 번씩 더 제출된다.
+          // 2026-10-01~02에 그렇게 122회가 쌓여 네이버가 계정에 보호조치를 걸었다.
+          //
+          // 대신 **비밀번호를 넣지 않고 쿠키만** 확인한다. 사람이 창에서 로그인해 두면
+          // 여기서 저절로 풀려 다음 주기부터 정상 가동한다.
+          let recovered = false;
+          try {
+            const { probeNaverSession } = await import('../src/lib/naver/uploader');
+            const probePage = await withTimeout(getPage(), 120_000, 'getPage(probe)');
+            recovered = await withTimeout(probeNaverSession(probePage), 60_000, 'probeNaverSession');
+          } catch (e: any) {
+            console.log('[CrawlDaemon] 세션 확인 실패(다음 주기에 다시 봅니다):', e?.message);
+          }
+
+          if (recovered) {
+            loginNeedsHuman = false;
+            console.log('[CrawlDaemon] ✅ 세션이 돌아왔습니다 — 자동 크롤을 재개합니다.');
+          } else {
+            await reportDaemonStatus({
+              name: 'crawler',
+              state: 'LOGIN_REQUIRED',
+              lastError: '네이버 로그인 필요 — 자동 재시도를 멈췄습니다. 창을 띄워 한 번 로그인해 주세요.',
+              detail: { clubId: CLUB_ID },
+            });
+            console.log('[CrawlDaemon] ⏸ 로그인 대기 — 자동 크롤 작업을 만들지 않습니다 (비밀번호 제출 없음).');
+          }
+        }
+        if (!loginNeedsHuman) {
+          const busy = await hasActiveJob();
+          if (!busy) {
+            job = await createScheduledJob();
+            if (job) console.log(`[CrawlDaemon] ⏰ 자동 크롤 작업 생성 (job ${job.id}) — 다음은 ${Math.round(scheduleIntervalMs / 60000)}분 뒤`);
+          }
         }
       }
 

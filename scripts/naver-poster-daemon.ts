@@ -64,13 +64,50 @@ const sb = createClient(SUPA_URL, SVC, { auth: { persistSession: false } });
 
 const POLL_MS = 10_000;
 const HEARTBEAT_MS = 60_000; // idle 상태에서도 생존 신호를 남기는 주기
-// 포스터는 작업이 있을 때만 브라우저를 띄우므로 세션이 방치되면 네이버가 기기확인을 요구한다.
-// 작업이 없어도 주기적으로 로그인 세션을 갱신해 "재업 요청 순간에야 로그인 깨진 걸 알게 되는" 상황을 막는다.
-const SESSION_REFRESH_MS = Math.max(1, Number(process.env.SESSION_REFRESH_HOURS || 6)) * 60 * 60 * 1000;
+
+/**
+ * 로그인 세션 점검 주기 — **매번 무작위로 뽑는다.** (2026-10-30 대표님 지시)
+ *
+ * 두 가지를 노린다.
+ *  ① **세션 유지.** 포스터는 작업이 있을 때만 브라우저를 띄우므로 방치하면 세션이 삭는다.
+ *     기존 6시간은 너무 길어 10/29에도 로그인이 끊긴 채 하루 반을 멈춰 있었다.
+ *  ② **기계 같은 리듬 제거.** 정확히 N시간마다 같은 동작을 하면 네이버 쪽에서 자동화로
+ *     보기 쉽다. 사람은 그렇게 규칙적으로 접속하지 않는다.
+ *
+ * 점검 자체는 가볍고 안전하다 — 세션이 살아 있으면 네이버 홈을 한 번 열어 **쿠키만**
+ * 확인하고 끝난다(uploader.ts의 hasLiveSession). 비밀번호는 세션이 끊겼을 때만 넣고,
+ * 그마저 연속 3회에서 멈춘다(loginToNaver의 차단기). 그래서 자주 돌려도 계정에 무리가 없다.
+ */
+const SESSION_MIN_MIN = Math.max(1, Number(process.env.SESSION_REFRESH_MIN_MINUTES || 10));
+const SESSION_MAX_MIN = Math.max(SESSION_MIN_MIN, Number(process.env.SESSION_REFRESH_MAX_MINUTES || 20));
+
+/** 다음 점검까지 기다릴 시간을 [최소, 최대] 사이에서 새로 뽑는다 */
+function pickSessionInterval(): number {
+  const span = SESSION_MAX_MIN - SESSION_MIN_MIN;
+  return Math.round((SESSION_MIN_MIN + Math.random() * span) * 60 * 1000);
+}
+
+/**
+ * PC가 절전에 들어갔다 깨어난 것을 감지하는 기준. (2026-10-30)
+ *
+ * 2026-10-28 23:40에 사람이 PC를 재웠고(모던 대기 S0), 7시간 넘게 자는 동안 세션 갱신이
+ * 멈췄다. 깨어나서 로그인하니 네이버가 "오래 끊겼던 기기"로 보고 기기확인을 요구했고,
+ * 자동화는 그걸 넘지 못해 결국 계정에 보호조치까지 걸렸다.
+ *
+ * 절전 중에는 setTimeout도 같이 멈춘다. 그래서 **폴링 한 바퀴에 걸린 실제 시간**이
+ * 비정상적으로 크면 그 사이 잠들어 있었다고 본다. 폴링이 10초인데 3분을 넘겼다면
+ * 정상적인 지연이 아니다.
+ */
+const WAKE_GAP_MS = 3 * 60_000;
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 let lastHeartbeatAt = 0;
 let lastSessionCheckAt = 0;
+/** 직전 루프 시각 — 절전 복귀 감지용 */
+let lastTickAt = Date.now();
+/** 이번에 뽑힌 대기 시간 — 점검할 때마다 다시 뽑는다 */
+let sessionIntervalMs = pickSessionInterval();
 let loginRequired = false; // 로그인 차단 감지 시 true — 세션 복구되면 해제
 
 /** idle/working 생존 신호 (실패는 조용히 무시 — 본작업을 막지 않는다) */
@@ -218,8 +255,10 @@ async function processJob(job: any) {
  * (대표님 지적: "쓸 때만 로그인하니까 텀에 로그인 인증이 걸려버린다")
  */
 async function refreshSessionIfDue() {
-  if (Date.now() - lastSessionCheckAt < SESSION_REFRESH_MS) return;
+  if (Date.now() - lastSessionCheckAt < sessionIntervalMs) return;
   lastSessionCheckAt = Date.now();
+  // 다음 점검 간격을 새로 뽑는다 — 같은 간격이 반복되지 않게
+  sessionIntervalMs = pickSessionInterval();
 
   const { ensurePosterSession, describeDiagnostics } = await import('../src/lib/naver/uploader');
   console.log('[Daemon] 🔄 로그인 세션 주기 점검 시작...');
@@ -228,7 +267,7 @@ async function refreshSessionIfDue() {
   if (ok) {
     loginRequired = false;
     await reportDaemonStatus({ name: 'poster', state: 'IDLE', markLoginCheck: true, lastError: null });
-    console.log('[Daemon] ✅ 세션 정상 — 다음 점검까지 대기');
+    console.log(`[Daemon] ✅ 세션 정상 — 다음 점검까지 ${Math.round(sessionIntervalMs / 60000)}분 대기`);
   } else {
     loginRequired = true;
     await reportDaemonStatus({
@@ -244,13 +283,25 @@ async function refreshSessionIfDue() {
 async function loop() {
   console.log('[Daemon] 🟢 네이버 카페 포스팅 데몬 시작. 큐 폴링 중... (Ctrl+C 종료)');
   console.log('[Daemon] 프로필 경로:', process.env.NAVER_PROFILE_DIR);
-  console.log(`[Daemon] 세션 주기 점검: ${SESSION_REFRESH_MS / 3_600_000}시간마다`);
+  console.log(`[Daemon] 세션 점검: ${SESSION_MIN_MIN}~${SESSION_MAX_MIN}분 사이 무작위 (이번 대기 ${Math.round(sessionIntervalMs/60000)}분)`);
   await beat('IDLE');
   // 기동 직후 1회 세션 점검 — 새 PC 설치 후 로그인 상태를 바로 확인할 수 있게 한다
   await refreshSessionIfDue().catch((e) => console.warn('[Daemon] 초기 세션 점검 실패:', e?.message));
 
   while (true) {
     try {
+      // 절전에서 깨어났으면 **기다리지 않고 바로** 세션을 점검한다. (2026-10-30)
+      // 자는 동안 네이버 세션이 삭는다. 다음 주기(최대 20분)까지 두면 그 사이에 들어온
+      // 재업 작업이 로그인 실패로 날아가고, 실패가 쌓이면 계정이 보호조치로 묶인다.
+      {
+        const gap = Date.now() - lastTickAt;
+        lastTickAt = Date.now();
+        if (gap > WAKE_GAP_MS) {
+          console.log(`[Daemon] ⏰ ${Math.round(gap / 60000)}분 공백 감지 (절전 복귀 추정) — 세션 즉시 점검`);
+          lastSessionCheckAt = 0; // 주기를 무시하고 지금 점검하게 만든다
+        }
+      }
+
       const job = await claimJob();
       if (!job) {
         if (Date.now() - lastHeartbeatAt >= HEARTBEAT_MS) await beat('IDLE');

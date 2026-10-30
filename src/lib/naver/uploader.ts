@@ -4,6 +4,7 @@ import path from 'path';
 import axios from 'axios';
 import { createClient } from '@supabase/supabase-js';
 import { uploadDiagnosticScreenshot } from './diagnostics';
+import { applyStealth, humanType, humanClick, humanClearField, humanSettle } from './stealth';
 
 interface UploadPayload {
   type?: 'NEW' | 'REPOST';
@@ -69,6 +70,14 @@ let loginSignals: { captcha: boolean; deviceConfirm: boolean; note: string } = {
   deviceConfirm: false,
   note: ''
 };
+
+/**
+ * 마지막 로그인 시도의 신호를 읽는다 (2026-10-02).
+ * 크롤러 데몬이 "사람이 로그인해 줘야 하는 상태"인지 판단해 자동 재시도를 멈추는 데 쓴다.
+ */
+export function getLastLoginSignals(): { captcha: boolean; deviceConfirm: boolean; note: string } {
+  return { ...loginSignals };
+}
 
 function setStage(stage: UploadStage) {
   currentStage = stage;
@@ -266,8 +275,105 @@ function cleanLocalTempImages(paths: string[]) {
 }
 
 /**
+ * 로그인 실패가 쌓이면 비밀번호 제출을 스스로 멈춘다 (2026-10-02 신설).
+ *
+ * 왜 필요한가: 계정 비밀번호가 바뀌어 세션이 끊긴 날, 수집기 데몬이 10분마다 재로그인을
+ * 시도해 18시간 동안 **122회** 비밀번호를 제출했다. 네이버는 이를 도용 시도로 보고
+ * 계정에 '아이디 보호조치'를 걸었다 — 본인확인 + 비밀번호 재변경을 해야만 풀린다.
+ * 즉 계속 찔러본 행위 자체가 피해를 키웠다.
+ *
+ * 그래서 연속 실패가 한도에 닿으면 자격증명 제출을 멈춘다. 멈춘 뒤에도 **쿠키만** 확인해서,
+ * 사람이 창에서 직접 로그인해 두면 저절로 풀리고 다시 돌아간다.
+ * (프로세스 단위 상태이므로 데몬을 재시작해도 초기화된다)
+ */
+const MAX_LOGIN_ATTEMPTS = Number(process.env.NAVER_MAX_LOGIN_ATTEMPTS || 3);
+let consecutiveLoginFailures = 0;
+let loginSubmitBlocked = false;
+
+/** 자격증명을 제출하지 않고 세션 쿠키만 본다 — 차단 상태에서도 안전하다 */
+async function hasLiveSession(page: Page): Promise<boolean> {
+  try {
+    await page.goto('https://www.naver.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    const cookies = await page.cookies();
+    return cookies.some((c) => c.name === 'NID_SES' || c.name === 'NID_AUT');
+  } catch {
+    return false;
+  }
+}
+
+/** 사람이 수동 로그인을 끝냈을 때 등 바깥에서 차단을 풀고 싶을 때 쓴다 */
+export function resetLoginBlock(): void {
+  consecutiveLoginFailures = 0;
+  loginSubmitBlocked = false;
+}
+
+/**
+ * 자격증명을 **제출하지 않고** 세션이 살아났는지만 확인한다 (2026-10-02).
+ *
+ * 로그인 대기 상태에 빠진 데몬이 스스로 복구할 길을 만들기 위한 것이다. 사람이 창에서
+ * 로그인해 두면 프로필에 쿠키가 생기므로, 이 함수가 true를 돌려주는 순간 데몬이 다시 돈다.
+ * 비밀번호를 넣지 않으므로 몇 번을 호출해도 계정 보호조치를 유발하지 않는다.
+ */
+export async function probeNaverSession(page: Page): Promise<boolean> {
+  const alive = await hasLiveSession(page);
+  if (alive) resetLoginBlock();
+  return alive;
+}
+
+/**
+ * 네이버 로그인 폼의 두 옵션을 데몬에 맞게 맞춘다. (2026-10-30)
+ *
+ * 기본값이 우리 용도와 **정확히 반대**였고, 이것이 세션이 자꾸 끊기던 진짜 원인이었다.
+ *
+ *   #loginStay (name=nvlong, 로그인 상태 유지)  기본 **꺼짐** → 세션이 짧게 만료된다
+ *   #switchIP  (name=ipcheck, IP 보안)        기본 **켜짐** → IP가 바뀌면 세션을 즉시 무효화한다
+ *
+ * 세션이 끊기면 데몬이 재로그인을 하고, 재로그인이 잦으면 네이버가 계정 도용으로 보고
+ * 기기확인 → 보호조치로 간다. 실제로 계정 두 개(hhj0190a·hasulim06)가 같은 경로로 묶였다.
+ * 사람이 손대지 않은 계정까지 걸린 이유가 이것으로 설명된다.
+ *
+ * 그래서 유지는 켜고 IP 보안은 끈다. 세션이 길어지면 로그인 횟수 자체가 줄어든다.
+ * (IP 보안은 세션을 IP에 묶는 기능이라, 고정 IP가 아닌 회선에서는 오히려 해가 된다)
+ *
+ * 체크박스가 커스텀 스위치라 값만 바꾸면 화면과 어긋날 수 있다. **사람처럼 눌러서** 바꾸고
+ * 결과를 되읽어 확인한다. 실패해도 로그인 자체는 막지 않는다.
+ */
+async function applyLoginOptions(page: Page): Promise<void> {
+  try {
+    const before = await page.evaluate(() => ({
+      stay: (document.querySelector('#loginStay') as HTMLInputElement | null)?.checked ?? null,
+      ip: (document.querySelector('#switchIP') as HTMLInputElement | null)?.checked ?? null,
+    }));
+
+    if (before.stay === false) {
+      // 라벨이 실제 클릭 대상이다 (input은 가려져 있을 수 있다)
+      if (!(await humanClick(page, 'label[for="loginStay"]'))) {
+        await page.click('label[for="loginStay"]').catch(() => page.click('#loginStay'));
+      }
+      await new Promise((r) => setTimeout(r, 250 + Math.floor(Math.random() * 350)));
+    }
+    if (before.ip === true) {
+      if (!(await humanClick(page, '#switchIP'))) {
+        await page.click('#switchIP').catch(() => {});
+      }
+      await new Promise((r) => setTimeout(r, 250 + Math.floor(Math.random() * 350)));
+    }
+
+    const after = await page.evaluate(() => ({
+      stay: (document.querySelector('#loginStay') as HTMLInputElement | null)?.checked ?? null,
+      ip: (document.querySelector('#switchIP') as HTMLInputElement | null)?.checked ?? null,
+    }));
+    console.log(
+      `[Uploader] 로그인 옵션 — 상태유지 ${before.stay}→${after.stay} / IP보안 ${before.ip}→${after.ip}`
+    );
+  } catch (e) {
+    console.warn('[Uploader] 로그인 옵션 설정 실패(로그인은 계속 진행):', (e as Error)?.message);
+  }
+}
+
+/**
  * 2차 인증이 해제된 스탭 부계정으로 네이버에 로그인합니다.
- * 캡차 차단을 피하기 위해 타이핑 딜레이 및 인풋 필드 주입을 정교하게 제어합니다.
+ * 자동화 흔적을 줄이기 위해 아이디·비밀번호를 실제 키 입력으로 넣습니다(./stealth.ts 참고).
  */
 export async function loginToNaver(page: Page): Promise<boolean> {
   const username = process.env.NAVER_USER_ID || '';
@@ -283,34 +389,72 @@ export async function loginToNaver(page: Page): Promise<boolean> {
   }
 
   // 영속 프로필(userDataDir)로 이미 로그인된 세션이 있으면 재로그인 생략
-  try {
-    await page.goto('https://www.naver.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
-    const existing = await page.cookies();
-    if (existing.some((c) => c.name === 'NID_SES' || c.name === 'NID_AUT')) {
-      console.log('[Uploader] 기존 네이버 세션 감지 — 재로그인 생략.');
-      return true;
-    }
-  } catch (e) {
-    console.log('[Uploader] 세션 사전확인 스킵, 로그인 진행.');
+  if (await hasLiveSession(page)) {
+    if (loginSubmitBlocked) console.log('[Uploader] 세션이 돌아왔습니다 — 로그인 차단 해제.');
+    resetLoginBlock();
+    console.log('[Uploader] 기존 네이버 세션 감지 — 재로그인 생략.');
+    return true;
+  }
+
+  // 연속 실패 한도를 넘었으면 더 이상 비밀번호를 제출하지 않는다.
+  // (위에서 세션을 이미 확인했으므로, 사람이 로그인해 두면 다음 호출에서 저절로 풀린다)
+  if (loginSubmitBlocked) {
+    loginSignals.note = 'LOGIN_BLOCKED_LOCAL';
+    console.error(
+      `[Uploader] ⛔ 로그인 연속 실패 ${consecutiveLoginFailures}회 — 비밀번호 제출을 중단했습니다. ` +
+        '계속 시도하면 네이버가 계정에 보호조치를 겁니다. ' +
+        '창을 띄워(NAVER_HEADLESS=false) 사람이 한 번 로그인한 뒤 데몬을 재시작하세요.'
+    );
+    return false;
   }
 
   console.log('[Uploader] 네이버 로그인 페이지 이동 중...');
   await page.goto('https://nid.naver.com/nidlogin.login', { waitUntil: 'domcontentloaded' });
-  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  // 도착하자마자 입력하지 않는다 — 사람은 화면을 한 번 본다 (./stealth.ts humanSettle)
+  await humanSettle(page);
 
   console.log('[Uploader] 네이버 계정 정보 자동 입력 중...');
-  // 네이버의 캡차 보안 차단을 피하기 위해 evaluate를 통해 인풋 벨류를 다이렉트로 설정
-  await page.evaluate((u, p) => {
-    const idInput = document.querySelector('#id') as HTMLInputElement;
-    const pwInput = document.querySelector('#pw') as HTMLInputElement;
-    if (idInput && pwInput) {
-      idInput.value = u;
-      pwInput.value = p;
-    }
-  }, username, password);
+  // 2026-10-02: evaluate로 value를 직접 꽂던 방식을 실제 키 입력으로 교체했다.
+  // 예전 주석은 "캡차 차단을 피하기 위해"라고 적혀 있었지만 사실은 반대였다 — value 주입은
+  // 키 이벤트를 하나도 만들지 않아 '사람이 친 흔적'이 비어 있고, 네이버는 그 흔적까지 본다.
+  // 비밀번호 변경 후 재로그인 때 캡차를 통과해도 "다시 로그인해 주세요"로 되돌아왔다.
+  //
+  // 2026-10-30: 칸 비우기도 JS value='' 대신 실제 키(Ctrl+A → Backspace)로 바꿨고,
+  // 입력 후 길이를 되읽어 검증한다. 한 글자라도 어긋난 채 제출하면 그건 로그인 실패 1회로
+  // 집계되고, 실패 누적이 곧 계정 보호조치다. 그래서 틀리면 **제출하지 않는다**.
+  let credentialsReady = false;
+  for (let attempt = 1; attempt <= 2 && !credentialsReady; attempt += 1) {
+    await humanClearField(page, '#id');
+    await humanClearField(page, '#pw');
 
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-  
+    const idOk = await humanType(page, '#id', username);
+    const pwOk = await humanType(page, '#pw', password);
+    credentialsReady = idOk && pwOk;
+
+    if (!credentialsReady) {
+      console.warn(
+        `[Uploader] 계정 입력이 온전하지 않습니다 (시도 ${attempt}/2) — id=${idOk} pw=${pwOk}`
+      );
+    }
+  }
+
+  if (!credentialsReady) {
+    // 제출하지 않았으므로 실패 횟수에 더하지 않는다. 네이버는 이 시도를 보지 못했다.
+    loginSignals.note = 'INPUT_VERIFY_FAILED';
+    console.error(
+      '[Uploader] ⛔ 아이디/비밀번호가 입력칸에 온전히 들어가지 않아 제출을 취소했습니다. ' +
+        '불완전한 값을 보내면 로그인 실패로 집계되어 계정 보호조치에 가까워집니다. ' +
+        '로그인 폼 마크업(#id/#pw)이 바뀌었는지 확인하세요.'
+    );
+    return false;
+  }
+
+  await applyLoginOptions(page);
+
+  // 다 채우고 바로 누르지 않는다
+  await new Promise((resolve) => setTimeout(resolve, 700 + Math.floor(Math.random() * 1100)));
+
   // 로그인 버튼 클릭
   // 네이버가 로그인 폼을 반응형으로 개편해(2026-07-30 확인) 기존 #log.login / .btn_login이 모두
   // 사라졌다. 현재는 #loginBtn_row(넓은 화면 표시)와 #loginBtn_column(좁은 화면 표시)이 공존하고,
@@ -324,7 +468,10 @@ export async function loginToNaver(page: Page): Promise<boolean> {
   });
 
   if (loginBtnId) {
-    await page.click(`#${loginBtnId}`);
+    // 궤적을 그려 다가가 버튼 안쪽 임의 지점을 누른다 (./stealth.ts humanClick)
+    if (!(await humanClick(page, `#${loginBtnId}`))) {
+      await page.click(`#${loginBtnId}`);
+    }
   } else {
     // 레거시 마크업 폴백 (구 로그인 페이지가 남아있는 경우)
     const legacyBtn = (await page.$('#log\\.login')) || (await page.$('.btn_login'));
@@ -348,6 +495,7 @@ export async function loginToNaver(page: Page): Promise<boolean> {
 
   if (isLoggedIn) {
     console.log('[Uploader] 네이버 로그인 성공!');
+    resetLoginBlock();
     return true;
   }
 
@@ -360,9 +508,18 @@ export async function loginToNaver(page: Page): Promise<boolean> {
     : blockers.deviceConfirm
       ? 'DEVICE_CONFIRM'
       : 'LOGIN_FAILED';
+
+  // 실패를 세고, 한도에 닿으면 이후 비밀번호 제출을 멈춘다 (계정 보호조치 방지)
+  consecutiveLoginFailures += 1;
+  if (consecutiveLoginFailures >= MAX_LOGIN_ATTEMPTS) {
+    loginSubmitBlocked = true;
+  }
+
   console.error(
-    `[Uploader] 네이버 로그인 실패 — captcha=${blockers.captcha} deviceConfirm=${blockers.deviceConfirm} ` +
-      `url=${blockers.url} title="${blockers.title}"`
+    `[Uploader] 네이버 로그인 실패(${consecutiveLoginFailures}/${MAX_LOGIN_ATTEMPTS}) — ` +
+      `captcha=${blockers.captcha} deviceConfirm=${blockers.deviceConfirm} ` +
+      `url=${blockers.url} title="${blockers.title}"` +
+      (loginSubmitBlocked ? ' → 이후 비밀번호 제출을 중단합니다.' : '')
   );
   return false;
 }
@@ -526,11 +683,14 @@ export async function ensurePosterSession(): Promise<{ ok: boolean; diagnostics:
     headless: process.env.NAVER_HEADLESS === 'false' ? false : true,
     protocolTimeout: 120_000,
     userDataDir: process.env.NAVER_PROFILE_DIR || undefined,
+    // 자동화 자백 플래그 제거 (2026-10-02) — 상세는 ./stealth.ts 주석
+    ignoreDefaultArgs: ['--enable-automation'],
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--window-size=1280,1024',
       '--disable-blink-features=AutomationControlled',
+      '--lang=ko-KR',
       // 프로필 영속화 + 비정상 종료 조합에서 뜨는 "복원하시겠습니까?" 버블이 클릭을 가로채는 것 방지
       '--hide-crash-restore-bubble',
       '--no-first-run',
@@ -544,9 +704,9 @@ export async function ensurePosterSession(): Promise<{ ok: boolean; diagnostics:
     await closeOtherTabs(browser, page);
     await installNameShim(page);
     await page.setViewport({ width: 1280, height: 1024 });
-    await page.setUserAgent(
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
+    await applyStealth(page);
+    // UA는 덮어쓰지 않는다 (2026-10-02) — 가짜 '맥 크롬 120'이 실제 윈도우 신호와 어긋나
+    // 평범한 브라우저보다 오히려 더 튀었다.
 
     const ok = await loginToNaver(page);
     if (!ok) {
@@ -626,11 +786,14 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
     protocolTimeout: 120_000,
     // NAVER_PROFILE_DIR 지정 시 크롬 프로필을 영속화 → 네이버 로그인 세션 유지(매번 재로그인 방지)
     userDataDir: process.env.NAVER_PROFILE_DIR || undefined,
+    // 자동화 자백 플래그 제거 (2026-10-02) — 상세는 ./stealth.ts 주석
+    ignoreDefaultArgs: ['--enable-automation'],
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--window-size=1280,1024',
       '--disable-blink-features=AutomationControlled',
+      '--lang=ko-KR',
       // 프로필 영속화 + 비정상 종료 조합에서 뜨는 "복원하시겠습니까?" 버블이 클릭을 가로채는 것 방지
       '--hide-crash-restore-bubble',
       '--no-first-run',
@@ -644,9 +807,8 @@ export async function uploadToNaverCafe(payload: UploadPayload): Promise<string 
     await closeOtherTabs(browser, page);
     await installNameShim(page);
     await page.setViewport({ width: 1280, height: 1024 });
-    await page.setUserAgent(
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
+    await applyStealth(page);
+    // UA는 덮어쓰지 않는다 (2026-10-02) — 상세는 ./stealth.ts 주석
 
     // 🚨 다이얼로그 실시간 감지 및 멤버 권한 오류 캐쳐 장착
     let hasMembershipError = false;

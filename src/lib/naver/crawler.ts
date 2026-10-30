@@ -1,5 +1,7 @@
 import puppeteer, { Page } from 'puppeteer';
 import { supabase } from '../supabase/client';
+import { applyStealth } from './stealth';
+import { normalizeCafeNickname } from './nickname';
 
 export interface ScrapedProduct {
   naverArticleId: string;
@@ -22,20 +24,22 @@ export async function scrapeArticleList(
 
   const browser = await puppeteer.launch({
     headless: true,
+    // 자동화 자백 플래그 제거 (2026-10-02) — 상세는 ./stealth.ts 주석
+    ignoreDefaultArgs: ['--enable-automation'],
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--window-size=1280,1024',
       '--disable-blink-features=AutomationControlled',
+      '--lang=ko-KR',
     ],
   });
 
   try {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 1024 });
-    await page.setUserAgent(
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
+    await applyStealth(page);
+    // UA는 덮어쓰지 않는다 (2026-10-02) — 가짜 '맥 크롬 120'이 실제 윈도우 신호와 어긋났다.
 
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
     await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -86,11 +90,14 @@ export async function scrapeArticleDetail(
 
   const browser = await puppeteer.launch({
     headless: true,
+    // 자동화 자백 플래그 제거 (2026-10-02) — 상세는 ./stealth.ts 주석
+    ignoreDefaultArgs: ['--enable-automation'],
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--window-size=375,812',
       '--disable-blink-features=AutomationControlled',
+      '--lang=ko-KR',
     ],
   });
 
@@ -102,6 +109,10 @@ export async function scrapeArticleDetail(
       isMobile: true,
       hasTouch: true,
     });
+    await applyStealth(page);
+    // 여기 아이폰 UA는 위장이 아니라 기능이다 — m.cafe.naver.com이 모바일 마크업을 내려주게
+    // 하려면 모바일 UA가 필요하다. 뷰포트·isMobile·hasTouch도 함께 모바일로 맞춰 두었으므로
+    // 신호가 서로 어긋나지 않는다. (PC 경로의 가짜 '맥 크롬 120'과는 성격이 다르다)
     await page.setUserAgent(
       'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1'
     );
@@ -618,11 +629,27 @@ function parsePriceAndFee(content: string): { sourcePrice: number | null; fee: n
 }
 
 /**
+ * 셀러가 쓰는 **홍보 문구** — "곧 품절될 만큼 인기"라는 뜻이지 품절이 아니다.
+ *
+ * 2026-10-16: "순삭품절템"이 들어간 샴푸가 계속 품절로 잡혀 손님이 주문을 못 했다.
+ * 운영 DB에서 품절 처리된 22건 중 7건이 이런 홍보 문구였다
+ * ("순삭품절템", "거의품절각", "현장품절템", "품절빨라요" 등).
+ *
+ * 품절어를 지우고 나서 판정하므로, "순삭품절템 (품절)"처럼 홍보 문구와 실제 표기가
+ * 같이 있으면 **품절로 본다**(뒤쪽 '(품절)'이 남는다). 안전한 쪽으로 기운다.
+ */
+const SOLDOUT_PROMO =
+  /(?:순삭|거의|곧|이미|초)?\s*품절\s*(?:템|각|주의|임박|예상|직전|대란|빨라요|빨라|빠름|각임)|순삭\s*품절|거의\s*품절|곧\s*품절/g;
+
+/**
  * 제목에서 품절 표기 감지 — 셀러가 "(품절)"/"완판" 등을 제목에 박는 패턴 (실측 2026-06-12, #418937)
  * 감지 시 is_soldout 자동 세팅으로 oversell 차단. 재게시에서 표기가 빠지면 자동 해제(카페가 소스).
+ *
+ * 2026-10-16: 홍보 문구를 먼저 걷어낸 뒤 판정한다(위 SOLDOUT_PROMO 참고).
  */
 export function detectSoldoutFromTitle(title: string): boolean {
-  return /품절|완판|솔드\s*아웃|sold\s*out/i.test(title || '');
+  const cleaned = String(title || '').replace(SOLDOUT_PROMO, ' ');
+  return /품절|완판|솔드\s*아웃|sold\s*out/i.test(cleaned);
 }
 
 /**
@@ -1006,7 +1033,9 @@ export async function scrapeCafeDetail(
       title: data.title,
       content: data.content,
       imageUrls: data.imageUrls,
-      authorNickname: data.authorNickname,
+      // 카페가 2026-10-14부터 닉네임 뒤에 직함을 붙여 내려준다("굿걸스텝 카페스탭").
+      // 그대로 저장하면 차단 작성자 판정(정확 일치)과 셀러 매칭이 둘 다 깨진다.
+      authorNickname: normalizeCafeNickname(data.authorNickname),
       postedAt,
       sourcePrice,
       fee,

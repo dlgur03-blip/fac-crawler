@@ -1,6 +1,6 @@
 import puppeteer, { Page } from 'puppeteer';
 import { supabase } from '../supabase/client';
-import { applyStealth } from './stealth';
+import { applyStealth, shouldRunHeadless } from './stealth';
 import { normalizeCafeNickname } from './nickname';
 
 export interface ScrapedProduct {
@@ -23,7 +23,8 @@ export async function scrapeArticleList(
   console.log(`[Crawler] 목록 수집을 위해 Puppeteer 실행 중... URL: ${url}`);
 
   const browser = await puppeteer.launch({
-    headless: true,
+    // 창 표시 여부도 설정에 따른다 (2026-10-30) — 헤드리스는 UA에 HeadlessChrome을 박아 보낸다
+    headless: shouldRunHeadless(),
     // 자동화 자백 플래그 제거 (2026-10-02) — 상세는 ./stealth.ts 주석
     ignoreDefaultArgs: ['--enable-automation'],
     args: [
@@ -89,7 +90,8 @@ export async function scrapeArticleDetail(
   console.log(`[Crawler] 상세 수집 중... Article ID: ${articleId}, URL: ${mobileUrl}`);
 
   const browser = await puppeteer.launch({
-    headless: true,
+    // 창 표시 여부도 설정에 따른다 (2026-10-30) — 모바일 뷰포트라 작은 창으로 뜬다
+    headless: shouldRunHeadless(),
     // 자동화 자백 플래그 제거 (2026-10-02) — 상세는 ./stealth.ts 주석
     ignoreDefaultArgs: ['--enable-automation'],
     args: [

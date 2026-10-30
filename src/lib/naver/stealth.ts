@@ -58,6 +58,34 @@ function gauss(mean: number, sd: number, min: number, max: number): number {
 const cursorAt = new WeakMap<Page, { x: number; y: number }>();
 
 /**
+ * 창을 띄울지 결정한다 (2026-10-30 신설).
+ *
+ * 이 PC는 수집·재업 전용이라 창을 띄워도 지장이 없다. 그리고 헤드리스 크롬은
+ * UA에 **`HeadlessChrome/149.0.0.0`** 을 박아 보낸다(실측 확인) — 로그인 화면에
+ * 자동화라고 스스로 알리는 것이다. 창을 띄우면 그 표식이 사라지고 렌더링도 실제 창이 된다.
+ *
+ * 기존 관례(`NAVER_HEADLESS === 'false'` 일 때만 창 표시)를 그대로 유지한다.
+ * 운영에서는 `.env.local` 에 `NAVER_HEADLESS=false` 를 둔다.
+ */
+export function shouldRunHeadless(): boolean {
+  return process.env.NAVER_HEADLESS !== 'false';
+}
+
+/**
+ * UA에서 자동화 표식만 지운다.
+ *
+ * 플랫폼을 위장하지는 않는다 — 가짜 UA는 플랫폼·폰트·WebGL 같은 다른 신호와 어긋나
+ * 평범한 브라우저보다 오히려 더 눈에 띈다(2026-10-02에 '맥 크롬 120' 위장을 걷어낸 이유).
+ */
+export function sanitizeUserAgent(ua: string): string {
+  return ua
+    .replace(/HeadlessChrome/gi, 'Chrome')
+    .replace(/\bHeadless\b/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+/**
  * 평범한 브라우저처럼 보이게 하는 패치.
  * 문서가 만들어지는 시점에 적용되므로 페이지 이동 후에도 유지된다.
  * newPage() 직후, 첫 goto() 전에 호출해야 한다.
@@ -77,6 +105,16 @@ export async function applyStealth(page: Page): Promise<void> {
   });
 
   await page.setExtraHTTPHeaders({ 'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8' });
+
+  // 헤드리스로 돌 때 UA에 박히는 "HeadlessChrome" 표식을 지운다.
+  // 창을 띄우는 운영 설정에서는 애초에 안 붙으므로 아무 일도 하지 않는다.
+  // (크롤러의 모바일 경로는 이 뒤에 아이폰 UA를 따로 지정하므로 영향 없다)
+  try {
+    const ua = await page.browser().userAgent();
+    if (/headless/i.test(ua)) await page.setUserAgent(sanitizeUserAgent(ua));
+  } catch {
+    /* UA를 못 읽어도 나머지 패치는 적용한다 */
+  }
 
   // 커서 초기 위치를 매번 다르게 둔다 (항상 0,0에서 출발하면 그 자체가 흔적이다)
   const vp = page.viewport();

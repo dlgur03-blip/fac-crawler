@@ -102,7 +102,7 @@ async function main() {
   console.log('  프로필 :', PROFILE, '(하나로 통일)');
   console.log('  창 표시 :', process.env.NAVER_HEADLESS === 'false' ? '예 (headful)' : '아니오 (headless)');
   console.log('  로그인 재시도 상한 :', process.env.NAVER_MAX_LOGIN_ATTEMPTS || '3');
-  console.log('  순서   : 수집 → 브라우저 닫기 → 재업 → 반복 (동시 실행 없음)');
+  console.log('  순서   : 수집 → 재업 → 반복 (같은 브라우저의 다른 탭, 동시 실행 없음)');
   console.log('═══════════════════════════════════════');
   console.log('');
 

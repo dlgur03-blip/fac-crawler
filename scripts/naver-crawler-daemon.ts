@@ -82,8 +82,35 @@ let scheduleIntervalMs = pickScheduleInterval();
  * 절전 중에는 setTimeout도 멈추므로 실제 경과 시간으로만 알 수 있다. (2026-10-30)
  */
 const WAKE_GAP_MS = 3 * 60_000;
-/** 직전 루프 시각 — 절전 복귀 감지용 */
-let lastTickAt = Date.now();
+
+/**
+ * 절전 감지는 **독립 타이머**로 한다. (2026-10-31 수정)
+ *
+ * 처음에는 '루프 한 바퀴의 경과 시간'으로 쟀다. 그런데 크롤 한 번이 3분 넘게 걸리므로
+ * **작업 시간이 공백으로 집계돼** 매 바퀴 절전 복귀로 오판했다. 그러면 주기를 무시하고
+ * 즉시 크롤하므로 8~13분 설정이 무력화되고 3분마다 돌았다
+ * (실측 2026-10-31 07:06·07:09·07:12·07:16 — 노출을 줄이려던 변경이 정반대로 작동했다).
+ *
+ * 30초마다 깨어나 직전 호출과의 간격만 보면 작업 시간과 무관하다. 절전 중에는 타이머도
+ * 멈추므로 간격이 크게 벌어지고, 그때만 복귀로 판정한다.
+ * (I/O 대기 중에도 타이머는 정상 발화한다 — 기존 watchdog이 같은 방식으로 동작한다)
+ */
+const WAKE_PROBE_MS = 30_000;
+let lastWakeProbeAt = Date.now();
+/** 절전에서 깨어났다는 신호 — 루프가 소비하고 지운다 */
+let wokeFromSleep = false;
+
+function startWakeProbe() {
+  setInterval(() => {
+    const now = Date.now();
+    const gap = now - lastWakeProbeAt;
+    lastWakeProbeAt = now;
+    if (gap > WAKE_GAP_MS) {
+      console.log(`[CrawlDaemon] ⏰ ${Math.round(gap / 60000)}분 공백 감지 (절전 복귀 추정)`);
+      wokeFromSleep = true;
+    }
+  }, WAKE_PROBE_MS);
+}
 
 const HEARTBEAT_MS = 60_000;     // 크롤 중 crawl_queue.updated_at 갱신 주기 (스로틀)
 const STALL_MS = 10 * 60_000;    // watchdog: 작업 중 무진행 10분이면 좀비로 판정 (아이템 1건 최악 ~2분의 5배)
@@ -867,6 +894,7 @@ export async function crawlStartup() {
   // 기동 직후 좀비 PROCESSING 회수 — 이전 프로세스가 hang 중 죽었어도 자동 크롤 재개 가능하게
   await recoverStaleJobs();
   startWatchdog();
+  startWakeProbe();
 }
 
 /**
@@ -893,14 +921,11 @@ export async function crawlTick() {
       // 절전에서 깨어났으면 다음 주기를 기다리지 않고 **바로** 한 번 돈다. (2026-10-30)
       // 2026-10-28에 사람이 PC를 재웠고(모던 대기), 자는 동안 세션이 삭아 깨어난 뒤
       // 로그인이 막혔다. 복귀 직후 바로 돌려 세션 상태를 확인하고, 밀린 수집도 당긴다.
-      // 절전 중에는 setTimeout도 멈추므로 루프 한 바퀴의 실제 경과 시간으로 판정한다.
-      {
-        const gap = Date.now() - lastTickAt;
-        lastTickAt = Date.now();
-        if (gap > WAKE_GAP_MS) {
-          console.log(`[CrawlDaemon] ⏰ ${Math.round(gap / 60000)}분 공백 감지 (절전 복귀 추정) — 즉시 크롤`);
-          lastScheduledAt = 0; // 주기를 무시하고 지금 작업을 만들게 한다
-        }
+      // 판정은 위 startWakeProbe()의 독립 타이머가 한다 — 작업 시간에 영향받지 않는다.
+      if (wokeFromSleep) {
+        wokeFromSleep = false;
+        console.log('[CrawlDaemon] 절전 복귀 — 주기를 무시하고 즉시 크롤합니다.');
+        lastScheduledAt = 0; // 주기를 무시하고 지금 작업을 만들게 한다
       }
 
       markProgress(); // idle 폴링도 진행으로 간주 (watchdog은 작업 중일 때만 무진행 판정)

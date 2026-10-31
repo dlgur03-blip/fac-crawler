@@ -104,8 +104,33 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 let lastHeartbeatAt = 0;
 let lastSessionCheckAt = 0;
-/** 직전 루프 시각 — 절전 복귀 감지용 */
-let lastTickAt = Date.now();
+
+/**
+ * 절전 감지는 **독립 타이머**로 한다. (2026-10-31 수정)
+ *
+ * 처음에는 '루프 한 바퀴의 경과 시간'으로 쟀다. 그런데 재업 1건이 1분 넘게 걸리고,
+ * 통합 데몬에서는 수집 차례까지 같은 바퀴에 끼므로 **작업 시간이 공백으로 집계돼**
+ * 매 바퀴 절전 복귀로 오판했다. 그러면 10~20분 주기가 무력화된다.
+ *
+ * 30초마다 깨어나 직전 호출과의 간격만 보면 작업 시간과 무관하다.
+ * 절전 중에는 타이머도 멈추므로 간격이 크게 벌어지고, 그때만 복귀로 판정한다.
+ */
+const WAKE_PROBE_MS = 30_000;
+let lastWakeProbeAt = Date.now();
+/** 절전에서 깨어났다는 신호 — 루프가 소비하고 지운다 */
+let wokeFromSleep = false;
+
+function startWakeProbe() {
+  setInterval(() => {
+    const now = Date.now();
+    const gap = now - lastWakeProbeAt;
+    lastWakeProbeAt = now;
+    if (gap > WAKE_GAP_MS) {
+      console.log(`[Daemon] ⏰ ${Math.round(gap / 60000)}분 공백 감지 (절전 복귀 추정)`);
+      wokeFromSleep = true;
+    }
+  }, WAKE_PROBE_MS);
+}
 /** 이번에 뽑힌 대기 시간 — 점검할 때마다 다시 뽑는다 */
 let sessionIntervalMs = pickSessionInterval();
 let loginRequired = false; // 로그인 차단 감지 시 true — 세션 복구되면 해제
@@ -286,6 +311,7 @@ export async function posterStartup() {
   console.log('[Daemon] 프로필 경로:', process.env.NAVER_PROFILE_DIR);
   console.log(`[Daemon] 세션 점검: ${SESSION_MIN_MIN}~${SESSION_MAX_MIN}분 사이 무작위 (이번 대기 ${Math.round(sessionIntervalMs/60000)}분)`);
   await beat('IDLE');
+  startWakeProbe();
   // 기동 직후 1회 세션 점검 — 새 PC 설치 후 로그인 상태를 바로 확인할 수 있게 한다
   await refreshSessionIfDue().catch((e) => console.warn('[Daemon] 초기 세션 점검 실패:', e?.message));
 }
@@ -302,13 +328,11 @@ export async function posterTick() {
       // 절전에서 깨어났으면 **기다리지 않고 바로** 세션을 점검한다. (2026-10-30)
       // 자는 동안 네이버 세션이 삭는다. 다음 주기(최대 20분)까지 두면 그 사이에 들어온
       // 재업 작업이 로그인 실패로 날아가고, 실패가 쌓이면 계정이 보호조치로 묶인다.
-      {
-        const gap = Date.now() - lastTickAt;
-        lastTickAt = Date.now();
-        if (gap > WAKE_GAP_MS) {
-          console.log(`[Daemon] ⏰ ${Math.round(gap / 60000)}분 공백 감지 (절전 복귀 추정) — 세션 즉시 점검`);
-          lastSessionCheckAt = 0; // 주기를 무시하고 지금 점검하게 만든다
-        }
+      // 판정은 위 startWakeProbe()의 독립 타이머가 한다 — 작업 시간에 영향받지 않는다.
+      if (wokeFromSleep) {
+        wokeFromSleep = false;
+        console.log('[Daemon] 절전 복귀 — 세션을 즉시 점검합니다.');
+        lastSessionCheckAt = 0; // 주기를 무시하고 지금 점검하게 만든다
       }
 
       const job = await claimJob();
